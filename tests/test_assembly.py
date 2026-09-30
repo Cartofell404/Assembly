@@ -927,31 +927,7 @@ class TestServer:
 
 
 
-    def test_web_chat_shell_is_public_but_data_is_not(self):
-        """The HTML shell must load so the UI can prompt for the key; the
-        data behind it must still require the token."""
-        from assembly.server import ModelManager, WEB_CHAT_HTML
-
-        mgr = ModelManager()
-        status, headers, _ = self._execute(
-            mgr,
-            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n",
-            api_key="secret",
-        )
-        assert status == 200, "chat shell must be reachable without a token"
-        assert "text/html" in headers["content-type"]
-        assert "fetchWithAuth" in WEB_CHAT_HTML
-
-        # Everything that actually returns data stays gated.
-        for path in (b"/health", b"/v1/models", b"/api/info", b"/api/tags"):
-            status, _, _ = self._execute(
-                mgr,
-                b"GET " + path + b" HTTP/1.1\r\nHost: localhost\r\n\r\n",
-                api_key="secret",
-            )
-            assert status == 401, f"{path.decode()} leaked data without a token"
-
-    def test_root_html_shell_is_public_when_key_is_set(self):
+    def test_root_is_gated_when_key_is_set(self):
         from assembly.server import ModelManager
 
         status, _, _ = self._execute(
@@ -959,7 +935,32 @@ class TestServer:
             b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n",
             api_key="secret",
         )
-        assert status == 200
+        assert status == 401
+
+    def test_chat_page_no_longer_exists(self):
+        """The web UI was removed; /chat must not serve anything."""
+        from assembly.server import ModelManager
+
+        status, headers, _ = self._execute(
+            ModelManager(),
+            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n",
+        )
+        assert status == 404
+        assert "text/html" not in headers.get("content-type", "")
+
+    def test_no_html_endpoint_is_public(self):
+        """No path may serve HTML without a token, now that the shell is gone."""
+        from assembly.server import ModelManager
+
+        mgr = ModelManager()
+        for path in (b"/", b"/chat", b"/index.html"):
+            status, headers, _ = self._execute(
+                mgr,
+                b"GET " + path + b" HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n",
+                api_key="secret",
+            )
+            assert status in (401, 404), f"{path.decode()} served {status}"
+            assert "text/html" not in headers.get("content-type", "")
 
     def test_root_json_is_still_gated(self):
         from assembly.server import ModelManager
@@ -1192,84 +1193,108 @@ class TestCLI:
         assert "disk gave up" in capsys.readouterr().err
 
 
-# ── Web UI ──────────────────────────────────────────────────────────────
+# ── Terminal UI ────────────────────────────────────────────────────────
+class TestTerminalUI:
+    """The CLI's rendering layer.
 
-
-class TestWebUI:
-    """Guards the HTML/JS embedded in server.py.
-
-    WEB_CHAT_HTML is a normal (non-raw) Python string, so a JS escape like
-    ``\\n`` is consumed by *Python* and lands in the page as a literal newline.
-    Inside a JS string literal that is an immediate SyntaxError, which would
-    ship a completely dead chat page with no test failing. These checks catch
-    that class of mistake.
+    Bugs here are invisible to unit tests that capture stdout, so these assert
+    on the returned values and on what the helpers actually write, not on how
+    a terminal happens to draw it.
     """
 
-    def _script(self) -> str:
-        import re
+    def test_prompt_contains_exactly_one_arrow(self):
+        """Regression: the prompt used to be drawn twice.
 
-        from assembly.server import WEB_CHAT_HTML
+        ``prompt_text()`` renders through a throwaway rich Console to build the
+        escape sequence. Pointing that Console at stdout made it print the
+        prompt, and then ``input()`` printed the returned copy again, so every
+        turn began with two arrows.
+        """
+        import re as _re
+        from assembly import ui
 
-        match = re.search(r"<script>(.*)</script>", WEB_CHAT_HTML, re.S)
-        assert match, "WEB_CHAT_HTML has no <script> block"
-        return match.group(1)
+        prompt = ui.prompt_text()
+        visible = _re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", prompt)
+        assert visible.count("▸") == 1, repr(prompt)
 
-    @staticmethod
-    def _unescaped_quote_count(line: str) -> int:
-        count, escaped = 0, False
-        for ch in line:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                count += 1
-        return count
+    def test_prompt_writes_nothing_to_stdout(self, capsys):
+        from assembly import ui
 
-    def test_js_block_is_extracted(self):
-        assert len(self._script()) > 500
+        ui.prompt_text()
+        captured = capsys.readouterr()
+        assert captured.out == "", f"prompt_text leaked {captured.out!r} to stdout"
 
-    def test_no_string_literal_is_split_across_lines(self):
-        """Every JS line must close its quotes; an odd count means breakage."""
-        offenders = [
-            (n, line)
-            for n, line in enumerate(self._script().split("\n"), 1)
-            if self._unescaped_quote_count(line) % 2
-        ]
-        assert not offenders, (
-            "JS string literal opened but not closed on line(s): "
-            + "; ".join(f"{n}: {line.strip()[:60]!r}" for n, line in offenders)
-        )
+    def test_palette_is_orange_dominant(self):
+        """Every accent must sit on the orange axis, or the CLI stops reading
+        as one product."""
+        from assembly import ui
 
-    def test_braces_and_parens_are_balanced(self):
-        script = self._script()
-        assert script.count("{") == script.count("}")
-        assert script.count("(") == script.count(")")
+        def hue(hex_colour: str) -> float:
+            r = int(hex_colour[1:3], 16) / 255
+            g = int(hex_colour[3:5], 16) / 255
+            b = int(hex_colour[5:7], 16) / 255
+            mx, mn = max(r, g, b), min(r, g, b)
+            if mx == mn:
+                return -1.0
+            if mx == r:
+                return ((g - b) / (mx - mn)) % 6
+            if mx == g:
+                return (b - r) / (mx - mn) + 2
+            return (r - g) / (mx - mn) + 4
 
-    def test_escape_sequences_survive_python_parsing(self):
-        """A \\n written in the JS must still be an escape, not a newline."""
-        script = self._script()
-        for literal in ('"Authorization": "Bearer "', "assembly_api_key"):
-            assert literal in script
+        warm = [ui.ORANGE_DEEP, ui.ORANGE, ui.ORANGE_LIT, ui.AMBER, ui.MUTED, ui.CREAM]
+        for colour in warm:
+            h = hue(colour) * 60
+            assert -1 <= h <= 70, f"{colour} is not orange-ish (hue {h:.0f})"
 
-    def test_fetch_calls_go_through_the_auth_wrapper(self):
-        """Plain fetch() cannot send a bearer token; the UI must use the wrapper."""
-        script = self._script()
-        assert "fetchWithAuth" in script
-        assert 'fetch("/v1/chat/completions"' not in script
-        assert 'fetch("/api/info"' not in script
+    def test_status_goes_to_stderr_only(self, capsys):
+        from assembly import ui
 
-    def test_model_names_are_not_injected_as_html(self):
-        from assembly.server import WEB_CHAT_HTML
+        with ui.status("loading"):
+            pass
+        captured = capsys.readouterr()
+        assert captured.out == "", "status must not pollute stdout"
+        assert "loading" in captured.err
 
-        script = self._script()
-        # Strip // comments so the explanatory comment mentioning innerHTML
-        # does not trip the check; what matters is that it is never assigned.
-        code = "\n".join(
-            line.split("//")[0] for line in script.split("\n")
-        )
-        assert "innerHTML" not in code
-        assert "assembly_name" in WEB_CHAT_HTML
+    def test_error_and_success_go_to_stderr(self, capsys):
+        from assembly import ui
+
+        ui.error("went wrong")
+        ui.success("went right")
+        captured = capsys.readouterr()
+        assert captured.out == "", "decorative output must not reach stdout"
+        assert "went wrong" in captured.err and "went right" in captured.err
+
+    def test_reply_goes_to_stdout(self, capsys):
+        from assembly import ui
+
+        ui.print_reply("the answer")
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "the answer"
+        assert captured.err == ""
+
+    def test_tables_render_without_raising(self, capsys):
+        from assembly import ui
+
+        ui.table("Models", ["name", "state"], [["Code", "idle"]])
+        captured = capsys.readouterr()
+        assert "Code" in captured.err
+        assert captured.out == ""
+
+    def test_banner_renders_without_raising(self, capsys):
+        from assembly import ui
+
+        ui.banner("Assembly", "listening on 127.0.0.1:8000",
+                  [("Archive", "mesh.asmb"), ("", ""), ("OpenAI", "http://x/v1")])
+        captured = capsys.readouterr()
+        assert "Assembly" in captured.err
+        assert captured.out == ""
+
+    def test_no_color_env_disables_styling(self, monkeypatch):
+        from assembly import ui
+
+        monkeypatch.setattr(ui, "_NO_COLOR", True)
+        assert ui.prompt_text() == "▸ "
 
 
 # ── Staging directory ─────────────────────────────────────────────────

@@ -157,41 +157,42 @@ def _cmd_init(args: argparse.Namespace) -> None:
 def _render_report(report, config_path: str) -> None:
     """Print a pre-flight validation report to the terminal."""
     name = report.config.assembly_name if report.config else Path(config_path).stem
-    print(f"\n{ui.Color.BOLD}Assembly Pre-Flight Check: {name}{ui.Color.RESET}")
-    print("─" * 65)
+    ui.blank()
+    ui.heading(f"Pre-flight check — {name}")
+    ui.rule()
 
     if report.models_info:
+        rows = []
         for m in report.models_info:
-            role = "Router" if m["role"] == "router_embedding" else "Model"
-            anchors_info = f" -> {m['anchors_count']} anchors" if "anchors_count" in m else ""
-            ui.success(f"{role:7s}: {m['name']:<18s} ({m['size_mb']:>7.1f} MB){anchors_info}")
+            role = "router" if m["role"] == "router_embedding" else "model"
+            anchors = f"{m['anchors_count']} anchors" if "anchors_count" in m else "—"
+            rows.append([m["name"], role, f"{m['size_mb']:.1f} MB", anchors])
+        ui.table("Models", ["name", "role", "size", "anchors"], rows)
+        ui.blank()
 
         total_gb = report.total_size_bytes / 1e9
-        print("─" * 65)
-        print(f"  • Estimated Archive Size: {total_gb:.2f} GB ({report.total_size_bytes:,} bytes)")
+        ui.dim(f"estimated archive size  {total_gb:.2f} GB ({report.total_size_bytes:,} bytes)")
         if report.free_disk_bytes:
-            print(f"  • Available Disk Space:   {report.free_disk_bytes / 1e9:.2f} GB")
+            ui.dim(f"available disk space    {report.free_disk_bytes / 1e9:.2f} GB")
 
     if report.warnings:
-        sys.stdout.flush()
-        print()
+        ui.blank()
         for w in report.warnings:
             ui.warn(f"[{w.field}] {w.message}")
 
     if report.errors:
-        sys.stdout.flush()
-        print()
+        ui.blank()
         for e in report.errors:
             ui.error(f"[{e.field}] {e.message}")
-        print("─" * 65)
+        ui.rule()
         ui.error(
-            f"Configuration has {len(report.errors)} error(s)! "
-            "Resolve them before building — no model data was written."
+            f"configuration has {len(report.errors)} error(s) — "
+            "no model data was written"
         )
         return
 
-    print("─" * 65)
-    ui.success("Configuration verified successfully! 100% ready for 'assembly build'.\n")
+    ui.rule()
+    ui.success("configuration verified — ready for 'assembly build'")
 
 
 def _cmd_validate(args: argparse.Namespace) -> None:
@@ -212,15 +213,13 @@ def _require_archive(path: str) -> str:
     """Fail fast with an actionable message when the archive isn't there."""
     resolved = Path(path).expanduser()
     if not resolved.is_file():
-        ui.error(f"No such archive: {resolved}")
-        print()
-        print(f"  {ui.Color.DIM}Build one with:{ui.Color.RESET}")
-        print("    assembly init")
-        print("    assembly validate -c assembly.config.json")
-        print(f"    assembly build -c assembly.config.json -o {resolved.name}")
-        print()
-        print(f"  {ui.Color.DIM}Already have one? Point at it with -m /path/to/file.asmb,{ui.Color.RESET}")
-        print(f"  {ui.Color.DIM}or cd into the folder so it is auto-detected.{ui.Color.RESET}")
+        ui.error(f"no such archive: {resolved}")
+        ui.blank()
+        ui.dim("build one:")
+        ui.dim("  assembly init")
+        ui.dim(f"  assembly build -c assembly.config.json -o {resolved.name}")
+        ui.blank()
+        ui.dim("already have one? point at it with -m /path/to/file.asmb")
         sys.exit(1)
     return str(resolved)
 
@@ -271,8 +270,8 @@ def _cmd_run(args: argparse.Namespace) -> None:
         return
 
     if explicit_server:
-        ui.error(f"No Assembly server at {server_url}")
-        print(f"  {ui.Color.DIM}Start one with:  assembly serve -m model.asmb --host {urlparse_host(server_url)}{ui.Color.RESET}")
+        ui.error(f"no Assembly server at {server_url}")
+        ui.dim(f"start one:  assembly serve -m model.asmb --host {urlparse_host(server_url)}")
         sys.exit(1)
 
     model_path = args.model
@@ -282,10 +281,10 @@ def _cmd_run(args: argparse.Namespace) -> None:
             model_path = str(detected)
 
     if not model_path:
-        ui.error("No archive found.")
-        print()
-        print(f"  {ui.Color.DIM}Run one of:{ui.Color.RESET}")
-        print("    assembly run -m model.asmb -p \"your prompt\"")
+        ui.error("no archive found.")
+        ui.blank()
+        ui.dim("run one of:")
+        ui.dim('  assembly run -m model.asmb -p "your prompt"')
         print("    cd into a folder with exactly one .asmb   (auto-detected)")
         print("    assembly serve -m model.asmb              (share over HTTP)")
         sys.exit(1)
@@ -601,7 +600,7 @@ class _Chat:
 
         self.backend.warm(text)
         if self.show_route:
-            print(ui.badge_router(name, score, is_fallback))
+            ui.dim(ui.badge_router(name, score, is_fallback))
 
         payload = list(self.messages) if self.memory else [
             {"role": "user", "content": text}
@@ -676,30 +675,29 @@ def _repl(backend: _Backend, max_tokens: int, show_route: bool, memory: bool) ->
 
 def _print_info(backend: _Backend) -> None:
     info = backend.info()
-    c = ui.Color
-
-    def field(label: str, value: Any) -> None:
-        if value in (None, "", [], {}):
-            return
-        print(f"  {c.DIM}{label:<10}{c.RESET} {value}")
-
-    field("assembly", info.get("assembly"))
-    field("source", info.get("source"))
-    field("router", info.get("router"))
+    rows = []
+    for label, key in (
+        ("assembly", "assembly"),
+        ("source", "source"),
+        ("router", "router"),
+    ):
+        if info.get(key):
+            rows.append([label, str(info[key])])
     persona = info.get("persona")
     if persona:
         short = persona if len(persona) <= 90 else persona[:90] + "…"
-        field("persona", short)
+        rows.append(["persona", short])
 
-    models = info.get("models") or []
-    if models:
-        print()
-        print(f"  {c.DIM}models{c.RESET}")
+    if rows:
+        ui.table("Assembly", ["field", "value"], rows)
+
+    if info.get("models"):
+        ui.blank()
         _print_models(backend)
 
 
 def _print_models(backend: _Backend) -> None:
-    c = ui.Color
+    rows = []
     for item in backend.info().get("models") or []:
         name = item.get("name", "?")
         bits = []
@@ -707,10 +705,13 @@ def _print_models(backend: _Backend) -> None:
             bits.append(f"{item['size'] / 1e9:.2f} GB")
         if item.get("anchors") is not None:
             bits.append(f"{item['anchors']} anchors")
-        if item.get("loaded"):
-            bits.append(f"{c.GREEN}loaded{c.RESET}")
-        tail = f"  {c.DIM}{' · '.join(bits)}{c.RESET}" if bits else ""
-        print(f"  {c.CYAN}{name}{c.RESET}{tail}")
+        rows.append([
+            name,
+            "loaded" if item.get("loaded") else "idle",
+            " · ".join(bits) or "—",
+        ])
+    if rows:
+        ui.table("Models", ["name", "state", "detail"], rows)
 
 
 def _handle_command(chat: _Chat, line: str) -> bool:
@@ -758,7 +759,7 @@ def _handle_command(chat: _Chat, line: str) -> bool:
             ui.error(str(exc))
             return False
         print()
-        print(ui.badge_router(model, score, is_fallback))
+        ui.dim(ui.badge_router(model, score, is_fallback))
         return False
 
     if name == "persona":

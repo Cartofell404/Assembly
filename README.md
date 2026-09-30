@@ -8,11 +8,28 @@
 
 Assembly Engine combines 1 embedding model (router) and N execution models (≥ 2) into a single binary `.asmb` file. When a prompt arrives, the engine computes a fast embedding, measures Cosine Similarity against pre-defined text anchors, selects the best model via `mmap`, and generates the response.
 
+Two commands matter: **`assembly serve`** hosts the archive over HTTP, and
+**`assembly run`** talks to it from any device. The rest (`init`, `validate`,
+`build`, `info`) exist to get an archive built in the first place.
+
 > **Note on disk usage.** On Linux the archive is memory-mapped and model blobs
 > are handed to `llama.cpp` as anonymous in-memory files. On macOS
 > `llama.cpp` requires a real path, so each model is staged as a temporary file
 > on first use. The archive is never extracted, but the first run on macOS
 > does read each model from disk. See [macOS staging](#macos-staging-and-disk-usage).
+
+## Terminal output
+
+Rendering is handled by [`rich`](https://github.com/Textualize/rich) with a
+single orange palette; cream is reserved for the model's own text so a reply
+is never confused for chrome.
+
+- **stdout is only ever the answer.** Banners, spinners, warnings and routing
+  badges all go to stderr, so `assembly run -m models.asmb "hi" | pbcopy`
+  yields the reply and nothing else.
+- Honours `NO_COLOR` and non-TTY output — redirected output contains no escape
+  sequences at all.
+- Set `ASSEMBLY_NO_SPINNER=1` to replace spinners with static lines.
 
 ---
 
@@ -41,7 +58,7 @@ Prompt → Embed → Cosine Similarity → Select Model → Generate
 pip install -e .
 ```
 
-Requires `llama-cpp-python` and `numpy`. `llama-cpp-python` compiles from
+Requires `llama-cpp-python`, `numpy` and `rich`. `llama-cpp-python` compiles from
 source on most platforms; install a prebuilt wheel for yours if a C++
 toolchain is unavailable.
 
@@ -209,13 +226,13 @@ $ assembly run -m my_models.asmb
 Mesh-1.0 · Code, General, Reasoning
 /help for commands · Ctrl+C or Ctrl+D to exit
 
->>> My name is Cartofell, remember that.
+▸ My name is Cartofell, remember that.
 Hello Cartofell! I'll remember that for this conversation.
 
->>> What is my name?
+▸ What is my name?
 Cartofell
 
->>> /clear
+▸ /clear
 conversation cleared
 ```
 
@@ -285,10 +302,8 @@ curl -X POST http://localhost:8000/api/route \
   -d '{"prompt": "Debug this memory leak"}'
 ```
 
-The browser chat at `/chat` asks for the key on first use and keeps it in
-`sessionStorage` for that tab only. The page itself is served without a token
-(browsers cannot attach an `Authorization` header to a page navigation), but
-everything it loads — model names and completions — is authenticated.
+The server speaks JSON only. There is no web UI — the terminal is the
+interface, and every endpoint is a plain API for your own scripts.
 
 ### 6. Inspect an archive
 

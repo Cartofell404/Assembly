@@ -24,12 +24,6 @@ First public release.
   duplicated descriptor was never closed.
 - `StagingError` was accidentally decorated with `@contextmanager`, turning
   the exception class into a function, so raising it would have failed.
-- The browser chat page could not authenticate against a server started with
-  `--api-key`; it now prompts once and keeps the key in `sessionStorage`.
-- `/chat` was itself behind the auth gate, which made the page unreachable in
-  a browser (browsers cannot attach an `Authorization` header to a
-  navigation). The static shell is now public; every data endpoint stays
-  authenticated.
 - `assembly info` leaked a file descriptor on a corrupt archive and did not
   `expanduser()` its argument.
 - A model file that disappears between validation and `stat()` produced a
@@ -55,6 +49,13 @@ First public release.
 - Version reported as `0.1.0` and sourced from `assembly/__init__.py`, which
   `pyproject.toml` now reads dynamically.
 - `python -m assembly` now works alongside the `assembly` console script.
+- The browser chat UI was removed along with the ~270 lines of embedded HTML,
+  CSS and JavaScript that carried it. `serve` now exposes JSON endpoints only,
+  so `/chat` returns 404 and no HTML is served anywhere. The terminal is the
+  interface; `assembly serve` and `assembly run` are the two commands that
+  matter day to day.
+- Terminal rendering moved to `rich` with a single orange palette. stdout is
+  still reserved for the model's reply, so piping behaviour is unchanged.
 - The test suite no longer ships a hand-rolled runner that could not support
   the fixtures its own tests use; pytest is the single entry point.
 
@@ -87,7 +88,6 @@ First public release.
 - `/api/load` can be confined to a directory with `--models-dir`, and reports
   a single generic error for missing files, non-archives, and out-of-jail
   paths so the endpoint cannot be used to probe the filesystem.
-- The web UI renders model names as text, not HTML.
 
 ### Robustness
 

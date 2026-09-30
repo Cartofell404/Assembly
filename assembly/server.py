@@ -6,8 +6,11 @@ Provides a multi-device REST API compatible with:
 - Ollama-style API (/api/generate, /api/chat)
 - Assembly native API (/api/route, /api/info, /api/load, /health)
 
-Allows scripts, external programs, Web UIs, and devices across LAN/WAN
+Allows scripts, external programs, and devices across LAN/WAN
 to interact with locally hosted .asmb assemblies.
+
+There is deliberately no web UI: the terminal is the interface, and every
+endpoint here is a plain JSON API.
 
 Security posture
 ----------------
@@ -36,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
-from assembly import __version__
+from assembly import __version__, ui
 from assembly.wrapper import AssemblyLlama
 
 logger = logging.getLogger("assembly.server")
@@ -259,15 +262,6 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
-    def _send_html(self, html_content: str) -> None:
-        payload = html_content.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._send_cors_headers()
-        self.end_headers()
-        self.wfile.write(payload)
-
     def _send_json(
         self,
         data: Any,
@@ -331,33 +325,8 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
     # GET Handlers
     # ─────────────────────────────────────────────────────────────────
 
-    def _is_public_shell(self) -> bool:
-        """True for the static chat page, which may be served without a token.
-
-        The page is a self-contained HTML shell: no model names, no data, and
-        no key are embedded in it — everything it renders comes from /api/info
-        and /v1/chat/completions, which stay authenticated. A browser cannot
-        attach an Authorization header to a top-level navigation, so gating
-        the page itself would make the UI permanently unreachable on an
-        authenticated server.
-        """
-        path = self.path.split("?")[0]
-        accept = self.headers.get("Accept", "")
-        return path == "/chat" or (path == "/" and "text/html" in accept)
-
     def do_GET(self) -> None:
         """Authenticate, dispatch, and never leak a traceback to the client."""
-        if self._is_public_shell():
-            try:
-                self._send_html(WEB_CHAT_HTML)
-            except (BrokenPipeError, ConnectionResetError):
-                raise
-            except Exception as exc:
-                logger.exception("Unhandled error serving web UI")
-                self._safe_error(f"internal error: {type(exc).__name__}",
-                                 HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-
         if not self._authorized():
             self._deny()
             return
@@ -381,7 +350,6 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "loaded_models_count": len(models),
                 "active_model": models[0]["id"] if models else None,
-                "web_ui": "/chat",
             })
             return
 
@@ -754,300 +722,28 @@ def serve(
     )
 
     host_str = "localhost" if is_loopback(host) else host
-    print("=" * 65)
-    print("  Assembly Engine Server is running!")
-    print(f"  • Listening on: http://{host}:{port}")
-    if model_path:
-        print(f"  • Active Model: {Path(model_path).name}")
-    else:
-        print("  • Active Model: (none, waiting for /api/load)")
+    base = f"http://{host_str}:{port}"
+    rows: list[tuple[str, str]] = [
+        ("Archive", Path(model_path).name if model_path else "none — waiting for /api/load"),
+        ("Models", ", ".join(m["name"] for m in manager.list_models()) or "none loaded"),
+        ("Auth", "bearer token required" if api_key else "none (loopback only)"),
+    ]
     if models_dir:
-        print(f"  • Models dir:   {models_dir}  (/api/load is jailed here)")
-    print(f"  • Auth:         {'bearer token required' if api_key else 'none (loopback only)'}")
-    print()
-    print("  Endpoints:")
-    print(f"  - Web chat:     http://{host_str}:{port}/chat")
-    print(f"  - OpenAI:       http://{host_str}:{port}/v1/chat/completions")
-    print(f"  - Ollama:       http://{host_str}:{port}/api/chat")
-    print(f"  - Route check:  http://{host_str}:{port}/api/route")
-    print(f"  - Health:       http://{host_str}:{port}/health")
-    print("=" * 65)
-    print("Press Ctrl+C to stop the server.\n")
+        rows.append(("Models dir", f"{models_dir}  (jailed)"))
+    rows.extend([
+        ("", ""),
+        ("OpenAI", f"{base}/v1/chat/completions"),
+        ("Ollama", f"{base}/api/chat"),
+        ("Route", f"{base}/api/route"),
+        ("Health", f"{base}/health"),
+    ])
+    ui.banner("Assembly Engine", f"listening on {host}:{port}", rows)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping Assembly server...")
+        ui.info("stopping server")
     finally:
         server.server_close()
         manager.close()
-        print("Server stopped cleanly.")
-
-
-WEB_CHAT_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Assembly Engine • Live Chat</title>
-<style>
-  :root {
-    --bg: #0d1117;
-    --card: #161b22;
-    --border: #30363d;
-    --accent: #58a6ff;
-    --accent-glow: rgba(88, 166, 255, 0.15);
-    --text: #c9d1d9;
-    --text-bright: #f0f6fc;
-    --user-msg: #1f6feb;
-    --bot-msg: #21262d;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-  }
-  header {
-    background: var(--card);
-    border-bottom: 1px solid var(--border);
-    padding: 12px 20px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text-bright); font-size: 1.1rem; }
-  .dot { width: 10px; height: 10px; background: #3fb950; border-radius: 50%; box-shadow: 0 0 8px #3fb950; }
-  .badges { display: flex; gap: 8px; font-size: 0.8rem; }
-  .badge { background: #30363d; padding: 4px 10px; border-radius: 12px; color: var(--text-bright); }
-  .badge-accent { background: var(--accent-glow); color: var(--accent); border: 1px solid var(--accent); }
-  #chat-container {
-    flex: 1;
-    overflow-y: auto;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    max-width: 900px;
-    width: 100%;
-    margin: 0 auto;
-  }
-  .msg-row { display: flex; flex-direction: column; }
-  .msg-row.user { align-items: flex-end; }
-  .msg-row.assistant { align-items: flex-start; }
-  .bubble {
-    max-width: 80%;
-    padding: 12px 16px;
-    border-radius: 16px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font-size: 0.95rem;
-  }
-  .msg-row.user .bubble {
-    background: var(--user-msg);
-    color: #fff;
-    border-bottom-right-radius: 4px;
-  }
-  .msg-row.assistant .bubble {
-    background: var(--bot-msg);
-    color: var(--text-bright);
-    border: 1px solid var(--border);
-    border-bottom-left-radius: 4px;
-  }
-  .route-tag {
-    font-size: 0.75rem;
-    margin-top: 4px;
-    color: #8b949e;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-  .route-tag span { color: #58a6ff; font-weight: 600; }
-  footer {
-    background: var(--card);
-    border-top: 1px solid var(--border);
-    padding: 14px 20px;
-  }
-  .input-bar {
-    max-width: 900px;
-    margin: 0 auto;
-    display: flex;
-    gap: 10px;
-  }
-  textarea {
-    flex: 1;
-    background: #0d1117;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    color: var(--text-bright);
-    padding: 12px 16px;
-    font-size: 1rem;
-    resize: none;
-    height: 48px;
-    outline: none;
-    font-family: inherit;
-  }
-  textarea:focus { border-color: var(--accent); }
-  button {
-    background: var(--accent);
-    color: #0d1117;
-    border: none;
-    border-radius: 12px;
-    padding: 0 20px;
-    font-weight: 600;
-    cursor: pointer;
-    font-size: 0.95rem;
-    transition: opacity 0.2s;
-  }
-  button:hover { opacity: 0.9; }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-</style>
-</head>
-<body>
-<header>
-  <div class="brand">
-    <div class="dot"></div>
-    <span>Assembly Engine</span>
-  </div>
-  <div class="badges" id="header-badges">
-    <div class="badge badge-accent" id="model-badge">Loading model...</div>
-  </div>
-</header>
-<div id="chat-container">
-  <div class="msg-row assistant">
-    <div class="bubble">Hello! I am Assembly. How can I help you today?</div>
-  </div>
-</div>
-<footer>
-  <div class="input-bar">
-    <textarea id="prompt-input" placeholder="Type a message... (Press Enter to send)" rows="1"></textarea>
-    <button id="send-btn" onclick="sendMessage()">Send</button>
-  </div>
-</footer>
-<script>
-const container = document.getElementById("chat-container");
-const input = document.getElementById("prompt-input");
-const sendBtn = document.getElementById("send-btn");
-const modelBadge = document.getElementById("model-badge");
-let conversation = [];
-
-// When the server runs with --api-key, this page has to authenticate too or
-// every request comes back 401. The key is kept in sessionStorage only: it is
-// per-tab, cleared on close, and never appended to a URL or written to disk.
-function authHeaders() {
-  const key = sessionStorage.getItem("assembly_api_key");
-  return key ? { "Authorization": "Bearer " + key } : {};
-}
-
-function promptForKey() {
-  const key = window.prompt("This server requires an API key. Enter the key used to start it:");
-  if (!key) return false;
-  sessionStorage.setItem("assembly_api_key", key.trim());
-  return true;
-}
-
-async function fetchWithAuth(path, options = {}, retried = false) {
-  const res = await fetch(path, {
-    ...options,
-    headers: { ...authHeaders(), ...(options.headers || {}) }
-  });
-  if (res.status === 401 && !retried && promptForKey()) {
-    return fetchWithAuth(path, options, true);
-  }
-  return res;
-}
-
-async function updateInfo() {
-  try {
-    const res = await fetchWithAuth("/api/info");
-    if (res.ok) {
-      const data = await res.json();
-      modelBadge.textContent = "⚡ " + data.assembly_name + " (" + data.models.length + " sub-models)";
-    } else if (res.status === 401) {
-      modelBadge.textContent = "🔒 API key required";
-    }
-  } catch(e) {}
-}
-updateInfo();
-
-input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
-});
-
-async function sendMessage() {
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = "";
-  sendBtn.disabled = true;
-
-  appendMsg("user", text);
-  conversation.push({ role: "user", content: text });
-
-  const loadingRow = appendMsg("assistant", "Thinking...");
-
-  try {
-    const res = await fetchWithAuth("/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: conversation, max_tokens: 512 })
-    });
-    const data = await res.json();
-    loadingRow.remove();
-
-    if (res.status === 401) {
-      appendMsg("assistant", "Unauthorized: check the API key for this server.");
-      conversation.pop();
-      return;
-    }
-    if (data.choices && data.choices[0]) {
-      const reply = data.choices[0].message ? data.choices[0].message.content : data.choices[0].text;
-      const routeInfo = data.assembly_route || {};
-      const subModel = routeInfo.selected_model ? "⚡ routed to: " + routeInfo.selected_model + " (" + Math.round((routeInfo.score || 0) * 100) + "%)" : "";
-      appendMsg("assistant", reply, subModel);
-      conversation.push({ role: "assistant", content: reply });
-    } else {
-      appendMsg("assistant", "Error: " + JSON.stringify(data));
-    }
-  } catch(err) {
-    loadingRow.remove();
-    appendMsg("assistant", "Network Error: " + err.message);
-  } finally {
-    sendBtn.disabled = false;
-    input.focus();
-  }
-}
-
-function appendMsg(role, text, tag) {
-  const row = document.createElement("div");
-  row.className = "msg-row " + role;
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-  bubble.textContent = text;
-  row.appendChild(bubble);
-
-  if (tag) {
-    const routeTag = document.createElement("div");
-    routeTag.className = "route-tag";
-    // textContent, not innerHTML: the tag embeds a model name from the
-    // archive header, which must never be parsed as markup.
-    const tagSpan = document.createElement("span");
-    tagSpan.textContent = tag;
-    routeTag.appendChild(tagSpan);
-    row.appendChild(routeTag);
-  }
-
-  container.appendChild(row);
-  container.scrollTop = container.scrollHeight;
-  return row;
-}
-</script>
-</body>
-</html>
-"""
+        ui.dim("server stopped cleanly")
