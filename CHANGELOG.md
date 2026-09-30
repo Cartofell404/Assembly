@@ -14,6 +14,12 @@ First public release.
 
 ### Fixed
 
+- `assembly serve` crashed with `KeyError: 'name'` while printing its startup
+  banner, immediately after finishing a multi-gigabyte archive load. The row
+  read a `name` key from `ModelManager.list_models()`, whose entries are keyed
+  `id` / `assembly_name` / `persona` / `active` / `models`. The display string
+  now comes from `ModelManager.describe_models()`, which lists the archive's
+  sub-models, and cannot be broken by a key rename.
 - Model loading copied every blob into RAM instead of mapping it. Slicing an
   `mmap` object returns `bytes`, so a 4 GB model was duplicated on each load
   and then crashed on `memoryview.release()`. Blobs are now taken as

@@ -1848,6 +1848,63 @@ class TestServerCompletionsSampling:
         assert kw["max_tokens"] == 256  # the legacy default, not the chat one
 
 
+class TestDescribeModels:
+    """The serve banner must not crash on an 11 GB archive it just loaded."""
+
+    def _manager(self, names=("Code", "General", "Reasoning"), alias="mesh"):
+        from assembly.server import ModelManager
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        llm = MagicMock()
+        llm.header.assembly_name = "Mesh-1.0"
+        llm.persona = "p"
+        llm.header.models = []
+        for n in names:
+            md = MagicMock()
+            md.name = n
+            llm.header.models.append(md)
+        mgr._models[alias] = llm
+        mgr._active_alias = alias
+        return mgr
+
+    def test_lists_sub_models(self):
+        mgr = self._manager()
+        assert mgr.describe_models() == "Code, General, Reasoning"
+
+    def test_empty_manager_says_so(self):
+        assert self._manager(names=()).describe_models() == "none loaded"
+
+    def test_duplicate_names_appear_once(self):
+        mgr = self._manager(names=("Code", "Code", "General"))
+        assert mgr.describe_models() == "Code, General"
+
+    def test_multiple_archives_are_merged(self):
+        mgr = self._manager()
+        second = self._manager(names=("General", "Vision"), alias="other")
+        mgr._models["other"] = second._models["other"]
+        assert mgr.describe_models() == "Code, General, Reasoning, Vision"
+
+    def test_keys_it_reads_actually_exist(self):
+        """Guards against reintroducing a typo'd key on a live startup path."""
+        mgr = self._manager()
+        for entry in mgr.list_models():
+            for key in ("id", "assembly_name", "persona", "active", "models"):
+                assert key in entry, f"list_models() lost {key!r}"
+            assert "name" not in entry
+
+    def test_serve_banner_rows_are_renderable(self, capsys):
+        """The row that crashed used to be built at print time."""
+        mgr = self._manager()
+        rows = [
+            ("Models", mgr.describe_models()),
+            ("Auth", "none (loopback only)"),
+        ]
+        ui.banner("Assembly Engine", "listening on 127.0.0.1:8000", rows)
+        out = capsys.readouterr().err
+        assert "Code, General, Reasoning" in out
+
+
 # ── Staging directory ─────────────────────────────────────────────────
 
 class TestStaging:

@@ -196,6 +196,20 @@ class ModelManager:
                 })
             return result
 
+    def describe_models(self) -> str:
+        """Human-readable list of the sub-models that are loaded.
+
+        Kept next to :meth:`list_models` because the shape of that dict is the
+        single source of truth; reading it here rather than in the caller keeps
+        a wrong key from taking the server down while it prints its banner.
+        """
+        names: list[str] = []
+        for entry in self.list_models():
+            for name in entry.get("models") or []:
+                if name not in names:
+                    names.append(name)
+        return ", ".join(names) or "none loaded"
+
     def close(self) -> None:
         with self._lock:
             for llm in self._models.values():
@@ -723,7 +737,7 @@ def serve(
     base = f"http://{host_str}:{port}"
     rows: list[tuple[str, str]] = [
         ("Archive", Path(model_path).name if model_path else "none — waiting for /api/load"),
-        ("Models", ", ".join(m["name"] for m in manager.list_models()) or "none loaded"),
+        ("Models", manager.describe_models()),
         ("Auth", "bearer token required" if api_key else "none (loopback only)"),
     ]
     if models_dir:
