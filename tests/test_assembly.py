@@ -2034,6 +2034,517 @@ class TestContextOverflow:
         assert status == 400
 
 
+class TestAutoContextWindow:
+    """The window is read from the archive, and cannot be overridden."""
+
+    def _gguf(self, context_length=None, arch="llama"):
+        """A minimal GGUF header carrying one KV pair."""
+        import struct
+
+        kv = b""
+        if arch is not None:
+            kv += struct.pack("<Q", len(b"general.architecture")) + b"general.architecture"
+            kv += struct.pack("<I", 8) + struct.pack("<Q", len(arch)) + arch.encode()
+        if context_length is not None:
+            key = f"{arch}.context_length".encode()
+            kv += struct.pack("<Q", len(key)) + key
+            kv += struct.pack("<I", 4) + struct.pack("<I", context_length)
+        blob = b"GGUF" + struct.pack("<I", 3)
+        blob += struct.pack("<QQ", 0, 2 if (arch and context_length) else 1)
+        return blob + kv
+
+    def test_reads_the_declared_length(self):
+        from assembly.config import gguf_context_length_from_bytes as f
+
+        assert f(self._gguf(131072)) == 131072
+
+    def test_key_is_namespaced_by_architecture(self):
+        """It is llama.context_length, not general.context_length."""
+        from assembly.config import gguf_context_length_from_bytes as f
+
+        assert f(self._gguf(4096, arch="qwen2")) == 4096
+
+    def test_unknown_architecture_still_found_by_scan(self):
+        from assembly.config import gguf_context_length_from_bytes as f
+
+        assert f(self._gguf(8192, arch="somefuturemodel")) == 8192
+
+    def test_missing_value_is_unknown_not_zero(self):
+        from assembly.config import gguf_context_length_from_bytes as f
+
+        assert f(self._gguf(None)) is None
+        assert f(self._gguf(0)) is None
+
+    def test_garbage_is_unknown(self):
+        from assembly.config import gguf_context_length_from_bytes as f
+
+        assert f(b"not a gguf at all") is None
+        assert f(b"") is None
+
+    def test_truncated_header_is_unknown(self):
+        from assembly.config import gguf_context_length_from_bytes as f
+
+        assert f(self._gguf(4096)[:20]) is None
+
+    def test_refactor_preserved_split_detection(self):
+        """The metadata reader replaced an inline parser; keep its contract."""
+        import struct
+
+        from assembly.config import gguf_split_info_from_bytes as f
+
+        blob = b"GGUF" + struct.pack("<I", 3) + struct.pack("<QQ", 0, 2)
+        for key, value in (("split.count", 3), ("split.no", 1)):
+            k = key.encode()
+            blob += struct.pack("<Q", len(k)) + k
+            blob += struct.pack("<I", 4) + struct.pack("<I", value)
+        assert f(blob) == (3, 1)
+
+
+class TestContextResolution:
+    """Smallest declared window wins; nothing can override it."""
+
+    def _llama(self, contexts):
+        """An AssemblyLlama shell with faked model offsets."""
+        from unittest.mock import MagicMock
+        from assembly.wrapper import AssemblyLlama
+
+        obj = AssemblyLlama.__new__(AssemblyLlama)
+        obj._model_contexts = {}
+        obj._n_ctx = 0
+        obj._log = lambda *a, **k: None
+
+        header = MagicMock()
+        header.models = []
+        for n in contexts:
+            m = MagicMock()
+            m.name = n
+            m.offset = 0
+            m.size = 1024
+            header.models.append(m)
+        obj._header = header
+
+        mm = MagicMock()
+        mm.__getitem__ = lambda self, key: b"x" * (4 << 20)
+        obj._mm = mm
+        return obj
+
+    def test_smallest_window_is_chosen(self, monkeypatch):
+        import assembly.wrapper as wrapper
+
+        values = iter([8192, 4096, 32768])
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: next(values))
+        obj = self._llama(["a", "b", "c"])
+        obj._resolve_context_window()
+        assert obj.context_window == 4096
+
+    def test_single_model_uses_its_own_window(self, monkeypatch):
+        import assembly.wrapper as wrapper
+
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: 65536)
+        obj = self._llama(["only"])
+        obj._resolve_context_window()
+        assert obj.context_window == 65536
+
+    def test_unknown_model_falls_back_conservatively(self, monkeypatch):
+        import assembly.wrapper as wrapper
+
+        values = iter([131072, None])
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: next(values))
+        obj = self._llama(["a", "b"])
+        obj._resolve_context_window()
+        assert obj.context_window == wrapper.FALLBACK_CONTEXT
+
+    def test_all_unknown_falls_back(self, monkeypatch):
+        import assembly.wrapper as wrapper
+
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: None)
+        obj = self._llama(["a", "b"])
+        obj._resolve_context_window()
+        assert obj.context_window == wrapper.FALLBACK_CONTEXT
+
+    def test_absurd_value_is_clamped(self, monkeypatch):
+        import assembly.wrapper as wrapper
+
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: 1 << 40)
+        obj = self._llama(["a"])
+        obj._resolve_context_window()
+        assert obj.context_window == wrapper.MAX_CONTEXT
+
+    def test_a_zero_window_counts_as_undeclared(self, monkeypatch):
+        """0 means "not declared", so the conservative fallback wins over
+        clamping to a useless 512."""
+        import assembly.wrapper as wrapper
+
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: 0)
+        obj = self._llama(["a"])
+        obj._resolve_context_window()
+        assert obj.context_window == wrapper.FALLBACK_CONTEXT
+
+    def test_absurdly_small_window_is_raised_to_the_floor(self, monkeypatch):
+        import assembly.wrapper as wrapper
+
+        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
+                            lambda head: 8)
+        obj = self._llama(["a"])
+        obj._resolve_context_window()
+        assert obj.context_window == wrapper.MIN_CONTEXT
+
+    def test_no_override_parameter_exists(self):
+        """The constructor must not accept a caller-chosen window."""
+        import inspect
+        from assembly.wrapper import AssemblyLlama
+
+        params = inspect.signature(AssemblyLlama.__init__).parameters
+        assert "n_ctx" not in params
+
+    def test_cli_has_no_n_ctx_flag(self):
+        from assembly.main import _build_parser
+
+        parser = _build_parser()
+        for argv in (["serve"], ["run"]):
+            args = parser.parse_args(argv)
+            assert not hasattr(args, "n_ctx"), argv
+
+    def test_cli_rejects_the_old_flag(self):
+        from assembly.main import _build_parser
+
+        parser = _build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["serve", "--n-ctx", "4096"])
+
+
+class TestConversationSummarization:
+    """History is compressed by the model instead of overflowing."""
+
+    def _slot(self, summary="SUMMARY TEXT", record=None):
+        from unittest.mock import MagicMock
+
+        slot = MagicMock()
+        slot.llama.tokenize.side_effect = lambda b, **k: list(b)[: max(1, len(b) // 4)]
+
+        def chat(messages, **kwargs):
+            if record is not None:
+                record.append((list(messages), kwargs))
+            return {"choices": [{"message": {"content": summary}}]}
+
+        slot.llama.create_chat_completion.side_effect = chat
+        return slot
+
+    def _llama(self, n_ctx=2048):
+        from assembly.wrapper import AssemblyLlama
+
+        obj = AssemblyLlama.__new__(AssemblyLlama)
+        obj._n_ctx = n_ctx
+        obj._persona = None
+        obj._active_slot = None
+        obj._log = lambda *a, **k: None
+        obj._last_summarized = False
+        obj._token_cache = {}
+        import threading
+        obj._lock = threading.Lock()
+        return obj
+
+    def _chat(self, turns=40):
+        msgs = []
+        for i in range(turns):
+            msgs.append({"role": "user", "content": f"turn {i} " * 20})
+            msgs.append({"role": "assistant", "content": f"reply {i} " * 20})
+        msgs.append({"role": "user", "content": "what did we decide?"})
+        return msgs
+
+    def test_short_conversation_is_untouched(self):
+        obj = self._llama()
+        slot = self._slot()
+        msgs = [{"role": "user", "content": "hi"}]
+        fitted, did = obj._fit_to_context(msgs, slot)
+        assert fitted == msgs
+        assert did is False
+
+    def test_long_conversation_is_summarized(self):
+        obj, slot = self._llama(2048), self._slot()
+        msgs = self._chat(60)
+        fitted, did = obj._fit_to_context(msgs, slot)
+        assert did is True
+        assert len(fitted) < len(msgs)
+
+    def test_summary_note_comes_first(self):
+        obj, slot = self._llama(2048), self._slot(summary="They picked blue.")
+        fitted, _ = obj._fit_to_context(self._chat(60), slot)
+        assert fitted[0]["role"] == "system"
+        assert "They picked blue." in fitted[0]["content"]
+
+    def test_final_question_is_preserved(self):
+        obj, slot = self._llama(2048), self._slot()
+        fitted, _ = obj._fit_to_context(self._chat(60), slot)
+        assert fitted[-1]["content"] == "what did we decide?"
+
+    def test_oldest_turns_are_the_ones_dropped(self):
+        obj, slot = self._llama(2048), self._slot()
+        fitted, _ = obj._fit_to_context(self._chat(60), slot)
+        bodies = [m.get("content") or "" for m in fitted]
+        assert not any("turn 0 " in b for b in bodies[1:])
+        assert any("turn 59 " in b for b in bodies[1:])
+
+    def test_start_of_conversation_reaches_the_summariser(self):
+        """Regression: trimming the transcript from the front lost exactly
+        the facts that were being asked about."""
+        obj, slot = self._llama(2048), self._slot()
+        seen = []
+        obj._summarize_transcript = lambda s, t, max_tokens: seen.append(t) or "ok"
+        obj._fit_to_context(self._chat(60), slot)
+        assert any("turn 0 " in t for t in seen)
+
+    def test_long_history_is_chunked_not_truncated(self):
+        obj = self._llama(2048)
+        chunks = obj._split_to_budget("\n".join(f"line {i}" * 10 for i in range(400)), 200)
+        assert len(chunks) > 1
+        assert "line 0" in chunks[0]
+
+    def test_chunks_all_fit_the_budget(self):
+        obj = self._llama(2048)
+        text = "\n".join(f"line {i} " * 10 for i in range(300))
+        for chunk in obj._split_to_budget(text, 200):
+            assert obj.count_tokens(chunk) <= 200 + obj.count_tokens("line 0 " * 10)
+
+    def test_everything_still_fits_after_summarizing(self):
+        """The note is text too, so the tail must give way if needed."""
+        obj, slot = self._llama(2048), self._slot(summary="A rather long summary. " * 200)
+        fitted, did = obj._fit_to_context(self._chat(60), slot)
+        assert did is True
+        limit = int(obj._n_ctx * 0.80)
+        assert obj._conversation_tokens(fitted) <= limit + 50
+
+    def test_history_is_not_retokenised_every_request(self):
+        """A growing conversation must not cost more to send each time.
+
+        Re-tokenising the joined history made every request cost more than the
+        last, which is the opposite of what a long session needs.
+        """
+        obj = self._llama(2048)
+        calls = []
+
+        class FakeSlot:
+            class llama:
+                @staticmethod
+                def tokenize(data, **kwargs):
+                    calls.append(data)
+                    return [0] * (len(data) // 4)
+
+        obj._active_slot = FakeSlot()
+
+        messages = []
+        for i in range(20):
+            messages.append({"role": "user", "content": f"turn {i} " * 20})
+            messages.append({"role": "assistant", "content": f"ok {i} " * 20})
+            obj._conversation_tokens(messages)
+
+        # 40 messages over 20 requests, plus the two role names: 42
+        # tokenisations in total rather than one per request.
+        assert len(calls) == 42
+        assert len(obj._token_cache) == 42
+
+    def test_the_cache_stays_bounded(self):
+        from assembly import wrapper
+
+        obj = self._llama(2048)
+        for i in range(wrapper.TOKEN_CACHE_ENTRIES + 50):
+            obj.count_tokens(f"unique line {i}")
+        assert len(obj._token_cache) <= wrapper.TOKEN_CACHE_ENTRIES
+
+    def test_runaway_repetition_is_condensed(self):
+        """Pasted logs must not crowd out the specifics being preserved."""
+        obj = self._llama(2048)
+        spam = "chatter 5. " * 80          # 160 words, 2 distinct
+        condensed = obj._condense(spam)
+        assert "(repeated 160 times)" in condensed
+        assert len(condensed) < len(spam) / 10
+
+    def test_ordinary_text_is_left_alone(self):
+        obj = self._llama(2048)
+        prose = "The certificate expires on 2026-11-04 and Alice owns the rollback runbook."
+        assert obj._condense(prose) == prose
+
+    def test_summary_output_is_capped(self):
+        """A summary must be bounded even when the window is enormous.
+
+        Passing the whole budget as the reply allowance let a verbose model
+        return a summary as long as the history it was compressing.
+        """
+        obj = self._llama(1 << 17)
+        slot = self._slot()
+        from assembly import wrapper
+
+        obj._summarize_transcript(slot, "a fairly long transcript " * 500,
+                                  max_tokens=100_000)
+        allowed = slot.llama.create_chat_completion.call_args.kwargs["max_tokens"]
+        assert allowed == wrapper.SUMMARY_OUTPUT_CEILING
+
+    def test_tiny_conversation_is_not_summarized(self):
+        obj, self_slot = self._llama(2048), self._slot()
+        slot = self_slot
+        fitted, did = obj._fit_to_context(self._chat(1), slot)
+        assert did is False
+
+    def test_empty_summariser_output_is_ignored(self):
+        obj, slot = self._llama(2048), self._slot(summary="   ")
+        msgs = self._chat(60)
+        fitted, did = obj._fit_to_context(msgs, slot)
+        assert fitted == msgs
+        assert did is False
+
+    def test_summariser_failure_keeps_the_conversation(self):
+        obj, slot = self._llama(2048), self._slot()
+        slot.llama.create_chat_completion.side_effect = RuntimeError("model died")
+        msgs = self._chat(60)
+        fitted, did = obj._fit_to_context(msgs, slot)
+        assert fitted == msgs
+        assert did is False
+
+    def test_summarising_never_recurses(self):
+        """The summariser must call the model directly, not through the
+        context-fitting path that would call it again."""
+        obj, slot = self._llama(2048), self._slot()
+        fitted, did = obj._fit_to_context(self._chat(60), slot)
+        assert did is True
+        # Exactly one summarisation request per chunk, and no nested fitting.
+        assert slot.llama.create_chat_completion.call_count >= 1
+
+    def test_summary_requests_are_bounded(self):
+        obj = self._llama(2048)
+        record = []
+        obj._fit_to_context(self._chat(60), self._slot(record=record))
+        for _messages, kwargs in record:
+            assert kwargs.get("stream") is False
+            assert 0 < kwargs["max_tokens"] <= obj._n_ctx
+
+    def test_repeated_fits_are_idempotent_in_shape(self):
+        obj, slot = self._llama(2048), self._slot()
+        once, _ = obj._fit_to_context(self._chat(60), slot)
+        twice, did = obj._fit_to_context(once, slot)
+        assert did is False
+        assert twice == once
+
+
+class TestContextReporting:
+    """Clients and the console learn what the window is."""
+
+    def _manager(self, contexts):
+        from assembly.server import ModelManager
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        llm = MagicMock()
+        llm.model_contexts = contexts
+        mgr._models["a"] = llm
+        mgr._active_alias = "a"
+        return mgr
+
+    def test_manager_reports_the_smallest(self):
+        assert self._manager({"a": 8192, "b": 4096}).context_window() == 4096
+
+    def test_manager_ignores_unknown_models(self):
+        assert self._manager({"a": 8192, "b": None}).context_window() == 8192
+
+    def test_manager_with_nothing_loaded(self):
+        from assembly.server import ModelManager
+
+        assert ModelManager().context_window() is None
+
+    def test_description_names_the_constraining_model(self):
+        text = self._manager({"a": 8192, "b": 4096}).describe_context()
+        assert "4,096" in text
+        assert "b" in text
+
+    def test_health_reports_the_window(self):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        mgr = self._manager({"a": 8192, "b": 4096})
+        sock = MockSocket(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        srv = MagicMock()
+        srv.manager = mgr
+        srv.api_key = None
+        srv.allow_origin = None
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), srv)
+        _h, _, body = sock.get_output().partition(b"\r\n\r\n")
+        assert json.loads(body)["context_window"] == 4096
+
+    def test_response_notes_the_window(self):
+        from assembly.server import AssemblyRequestHandler, ModelManager
+        from unittest.mock import MagicMock
+        from assembly.wrapper import RouteResult
+
+        mgr = ModelManager()
+        llm = MagicMock()
+        llm.header.assembly_name = "A"
+        llm.header.models = []
+        llm.route.return_value = RouteResult(
+            model_name="m", model_index=0, score=0.5, is_fallback=False
+        )
+        llm.context_window = 4096
+        llm._last_summarized = False
+        llm.create_chat_completion.return_value = {
+            "choices": [{"message": {"content": "hi"}}]
+        }
+        mgr._models["a"] = llm
+        mgr._active_alias = "a"
+
+        payload = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        sock = MockSocket(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+        )
+        srv = MagicMock()
+        srv.manager = mgr
+        srv.api_key = None
+        srv.allow_origin = None
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), srv)
+        _h, _, body = sock.get_output().partition(b"\r\n\r\n")
+        note = json.loads(body)["assembly_context"]
+        assert note == {"window": 4096, "summarized": False}
+
+    def test_metadata_never_breaks_a_response(self):
+        """A weird window value must not turn a 200 into a 500."""
+        from assembly.server import ModelManager, AssemblyRequestHandler
+        from assembly.wrapper import RouteResult
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        llm = MagicMock()
+        llm.header.assembly_name = "A"
+        llm.header.models = []
+        llm.route.return_value = RouteResult(
+            model_name="m", model_index=0, score=0.5, is_fallback=False
+        )
+        llm.context_window = object()      # unserialisable
+        llm._last_summarized = False
+        llm.create_chat_completion.return_value = {
+            "choices": [{"message": {"content": "hi"}}]
+        }
+        mgr._models["a"] = llm
+        mgr._active_alias = "a"
+
+        payload = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        sock = MockSocket(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+        )
+        srv = MagicMock()
+        srv.manager = mgr
+        srv.api_key = None
+        srv.allow_origin = None
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), srv)
+        header, _, body = sock.get_output().partition(b"\r\n\r\n")
+        assert int(header.decode().split()[1]) == 200
+        assert json.loads(body)["assembly_context"]["window"] is None
+
+
 # ── Staging directory ─────────────────────────────────────────────────
 
 class TestStaging:

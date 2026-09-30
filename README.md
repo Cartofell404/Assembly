@@ -195,28 +195,49 @@ out, and the number of concurrently loaded models is bounded.
 | `--allow-origin ORIGIN` | Allow one CORS origin, e.g. `http://localhost:5173`. Omitted by default: no browser origin may call the server |
 | `--models-dir DIR` | Confine the `/api/load` endpoint to `.asmb` files inside `DIR` |
 | `--temp-dir DIR` | Where model blobs are staged on macOS (see below) |
-| `--n-ctx N` | Context window per model, default `2048`. Raise it if long conversations overflow (see below) |
 
 #### Context window
 
-Every loaded model gets `--n-ctx` tokens to work with, and the persona plus the
-whole message history have to fit inside it. When a conversation outgrows the
-window, the server says so plainly and returns `400` — including on streaming
-requests, which are checked before any part of the response is sent:
+The window is not a setting. Assembly reads each model's GGUF metadata at load
+time and uses the **smallest** context length declared by any of the archive's
+execution models, so a request is never sized for a model that cannot hold it:
 
-```json
-{"error": {"message": "Conversation is too long for the context window:
-2087 tokens against a limit of 2048. Start a new conversation, shorten the
-history, or restart the server with a larger window (e.g. --n-ctx 4096).",
-"code": 400}}
+```bash
+assembly serve -m my_models.asmb   # banner shows: Context  131,072 tokens
 ```
 
-Either start a new conversation, or restart with a bigger window. Models vary in
-how much context they can hold, so give `--n-ctx` a value no larger than the
-smallest model in the archive supports.
+There is deliberately no flag to override it. A caller-chosen window can
+exceed what a bundled model was trained for, which fails late and
+confusingly, or undershoot it, which discards capability for nothing. The
+router's embedding model is excluded, because it embeds single sentences and
+is typically built with a tiny window of its own — including it would cap the
+whole assembly at the embedding model's window rather than the chat models'.
 
-CORS is off by default on purpose. Enable a single specific origin only if a
-browser client needs it; do not use `*` on a network-exposed server.
+The current window is also reported on `/health`, as `context_window`.
+
+#### Long conversations are summarised, not refused
+
+When a conversation approaches 80% of the window, Assembly asks the model to
+summarise the earlier turns and continues from that summary plus the most
+recent exchanges, instead of failing. Summarisation happens in stages when the
+history is long enough that one request cannot hold it, so the beginning of the
+conversation reaches the summary rather than being trimmed away:
+
+```
+▸ What were the first two deploy keys?
+  ↻ earlier turns summarised to fit the 131,072-token context window
+The first two were secret-000 and secret-001.
+```
+
+The note goes to stderr, so the answer on stdout stays pipeable. HTTP clients
+learn about it too, so they can stop replaying turns that are no longer sent:
+
+```json
+{"assembly_context": {"window": 131072, "summarized": true}}
+```
+
+If summarisation fails for any reason the original history is used unchanged,
+so it never becomes a second way for a request to fail.
 
 ### 4. Run Inference (`assembly run`)
 
@@ -387,7 +408,7 @@ assembly info -m my_models.asmb
 ```python
 from assembly.wrapper import AssemblyLlama
 
-with AssemblyLlama("my_models.asmb", n_ctx=2048, verbose=True) as llm:
+with AssemblyLlama("my_models.asmb", verbose=True) as llm:
     # All underlying models share the same persona identity!
     print(llm.chat("Kim jesteś?"))  # -> "Jestem Assembly..."
 

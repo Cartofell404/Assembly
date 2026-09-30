@@ -35,10 +35,40 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 
-from assembly.config import gguf_split_info_from_bytes
+from assembly.config import (
+    gguf_context_length_from_bytes,
+    gguf_split_info_from_bytes,
+)
 from assembly.header import PREAMBLE_SIZE, AsmbHeader, InvalidArchiveError, read_header
 from assembly.router import RouteResult, Router
 
+
+# Used only when an archive declares no usable context length anywhere. It is
+# the historical default, so an archive that cannot be introspected behaves
+# exactly as it did before the window was derived from the models.
+FALLBACK_CONTEXT = 2048
+
+# Bounds on an auto-detected window. The floor keeps a misdeclared value of 0
+# from producing an unusable model; the ceiling stops a corrupt header from
+# asking for a KV cache large enough to exhaust memory.
+MIN_CONTEXT = 512
+MAX_CONTEXT = 1 << 20
+
+# Fraction of the window at which a conversation is summarised, and the share
+# of the window the replacement summary plus recent turns may occupy.
+# Triggering late would leave no room to fit the summary itself.
+SUMMARIZE_AT = 0.80
+SUMMARIZED_BUDGET = 0.50
+# A summary is running notes, not a retelling. Capping the reply keeps
+# summarisation quick and stops a verbose model from returning a "summary"
+# as long as the history it was meant to compress.
+SUMMARY_OUTPUT_CEILING = 512
+# Token counts are memoised so a growing conversation stops costing more and
+# more per request. The cap bounds the memory a very long session can hold.
+TOKEN_CACHE_ENTRIES = 4096
+
+# Tokens reserved for the chat template, the persona and the reply itself.
+TEMPLATE_OVERHEAD = 96
 
 #: Where the per-process staging directory for model blobs is created.
 #: Overridable with the ``ASSEMBLY_TEMP_DIR`` environment variable or the
@@ -211,8 +241,9 @@ class AssemblyLlama:
     ----------
     asmb_path:
         Path to a packed ``.asmb`` archive.
-    n_ctx:
-        Context length forwarded to every loaded execution model.
+    The context window is not configurable: it is read from the archive as the
+    smallest context length declared by any of its execution models, so an
+    assembly can never be sized for a model that cannot hold it.
     n_gpu_layers:
         GPU layer offload count forwarded to execution models.
     verbose:
@@ -230,7 +261,6 @@ class AssemblyLlama:
         asmb_path: str | Path,
         *,
         persona: Optional[str] = None,
-        n_ctx: int = 2048,
         n_gpu_layers: int = 0,
         verbose: bool = False,
         temp_dir: Optional[str | Path] = None,
@@ -240,7 +270,10 @@ class AssemblyLlama:
 
         self._Llama = Llama
         self._asmb_path = Path(asmb_path).expanduser().resolve()
-        self._n_ctx = n_ctx
+        # Set from the archive in _setup(); there is deliberately no way to
+        # override it, see _resolve_context_window.
+        self._n_ctx = FALLBACK_CONTEXT
+        self._model_contexts: dict[str, Optional[int]] = {}
         self._n_gpu_layers = n_gpu_layers
         self._verbose = verbose
         self._llama_kwargs = llama_kwargs
@@ -260,6 +293,9 @@ class AssemblyLlama:
         self._embedding_llama: Any = None
         self._model_cache: dict[str, _ModelSlot] = {}
         self._active_slot: Optional[_ModelSlot] = None
+        self._last_summarized = False
+        self._token_cache: dict[str, int] = {}
+        self._last_prompt_tokens = 0
         self._persona: Optional[str] = persona or None
         self._lock = threading.RLock()
 
@@ -300,6 +336,9 @@ class AssemblyLlama:
 
         # ── Router ───────────────────────────────────────────────────
         self._router = Router(header)
+
+        # ── Derive the context window from the archive ───────────────
+        self._resolve_context_window()
 
         # ── Load the (small) embedding model into RAM ────────────────
         emb = header.embedding
@@ -342,6 +381,69 @@ class AssemblyLlama:
     # ------------------------------------------------------------------
     # Model loading from mmap
     # ------------------------------------------------------------------
+
+    def _resolve_context_window(self) -> None:
+        """Derive the context window from the archive's execution models.
+
+        The window is whatever the *smallest* execution model in the archive
+        declares in its GGUF metadata, so no request can be sized for a model
+        that cannot hold it. The router's embedding model is excluded on
+        purpose: it embeds single sentences, is typically built with a tiny
+        window (2048 is common), and has nothing to do with how long a
+        conversation may run.
+
+        There is no override. A user-supplied window could exceed what a
+        bundled model was trained for, which fails late and confusingly, or
+        undershoot it, which throws away capability for no reason.
+        """
+        assert self._mm is not None and self._header is not None
+
+        contexts: dict[str, Optional[int]] = {}
+        for model in self._header.models:
+            head = bytes(self._mm[model.offset : model.offset + (4 << 20)])
+            contexts[model.name] = gguf_context_length_from_bytes(head)
+        self._model_contexts = contexts
+
+        unknown = [name for name, value in contexts.items() if not value]
+        known = [value for value in contexts.values() if value]
+
+        if not known:
+            self._n_ctx = FALLBACK_CONTEXT
+            self._log(
+                f"No model declares a context length; using {FALLBACK_CONTEXT}"
+            )
+            return
+
+        window = min(known)
+
+        if unknown:
+            # One unknown model could be smaller than everything measured, and
+            # guessing high would fail only once that model is routed to.
+            self._n_ctx = FALLBACK_CONTEXT
+            self._log(
+                f"{', '.join(sorted(unknown))} declare no context length; "
+                f"falling back to {FALLBACK_CONTEXT} rather than assume "
+                f"{min(known)} is safe"
+            )
+            return
+
+        if window < MIN_CONTEXT or window > MAX_CONTEXT:
+            self._log(
+                f"Declared context {window} is out of range; clamping to "
+                f"{max(MIN_CONTEXT, min(MAX_CONTEXT, window))}"
+            )
+        self._n_ctx = max(MIN_CONTEXT, min(MAX_CONTEXT, window))
+
+    @property
+    def context_window(self) -> int:
+        """The context window every execution model in this archive was
+        loaded with."""
+        return self._n_ctx
+
+    @property
+    def model_contexts(self) -> dict[str, Optional[int]]:
+        """Per-model declared context lengths, for diagnostics."""
+        return dict(self._model_contexts)
 
     def _load_llama_from_mmap(
         self,
@@ -532,6 +634,281 @@ class AssemblyLlama:
         with self._lock:
             return slot.llama.create_completion(prompt, **kwargs)
 
+    # ------------------------------------------------------------------
+    # Keeping a conversation inside the context window
+    # ------------------------------------------------------------------
+
+    def count_tokens(self, text: str) -> int:
+        """Approximate the token count of *text* with the loaded tokenizer.
+
+        Results are memoised on the exact text. The same turns get counted on
+        every request, so without this the history is tokenised over and over:
+        slow at first, and slower with every turn added.
+
+        Falls back to a character-based estimate when no model is loaded yet,
+        because this is only ever used to decide *whether* to summarise, and a
+        rough answer is better than making every call wait on a model load.
+        """
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
+
+        count = None
+        if self._active_slot is not None:
+            try:
+                with self._lock:
+                    count = len(
+                        self._active_slot.llama.tokenize(
+                            text.encode("utf-8"), add_bos=False, special=False
+                        )
+                    )
+            except Exception:
+                count = None
+        if count is None:
+            count = max(1, len(text) // 4)
+
+        if len(self._token_cache) >= TOKEN_CACHE_ENTRIES:
+            # A conversation only ever grows, so the oldest entries are the
+            # least likely to be needed again. Dropping the lot is simpler
+            # than ordering them, and costs one re-tokenisation.
+            self._token_cache.clear()
+        self._token_cache[text] = count
+        return count
+
+    def _conversation_tokens(self, messages: "list[dict[str, str]]") -> int:
+        """Tokens the templated prompt would need, including chat overhead.
+
+        Counted message by message rather than as one joined blob so the cache
+        can reuse each turn's result. Re-joining and re-tokenising the whole
+        conversation made every request cost more than the last, which is
+        exactly when there is least appetite for it.
+        """
+        total = TEMPLATE_OVERHEAD
+        for message in messages:
+            content = message.get("content")
+            if not content:
+                continue
+            total += self.count_tokens(message.get("role", "")) + 1
+            total += self.count_tokens(content) + 1
+        return total
+
+    _SUMMARY_SYSTEM = (
+        "You compress conversations into running notes for a colleague with no "
+        "access to the original.\n\n"
+        "Copy through verbatim every name, identifier, key, number, date, "
+        "path, command, decision and commitment that appears. These are the "
+        "whole point: a later question about the start of the conversation can "
+        "only be answered if they are still here.\n\n"
+        "Discard small talk, repetition and padding. Never describe the "
+        "conversation's shape or comment on the transcript -- just record what "
+        "was said and decided.\n\n"
+        "Answer with the notes only. No preamble, no headings, no questions, "
+        "and no closing remarks."
+    )
+
+    @staticmethod
+    def _condense(text: str) -> str:
+        """Collapse runaway repetition within one message.
+
+        Pasted logs, spinner frames and repeated filler can turn a single turn
+        into thousands of near-identical words. Left in, they crowd out the
+        handful of specifics the summary exists to preserve, and they make the
+        summarisation request itself slow. A message built from a tiny
+        vocabulary repeated over and over is reported once instead.
+        """
+        words = text.split()
+        if len(words) > 24 and len(set(words)) <= 4:
+            return " ".join(words[:8]) + f" (repeated {len(words)} times)"
+        return text
+
+    def _summarize_once(
+        self, slot: "_ModelSlot", transcript: str, max_output: int
+    ) -> str:
+        """Ask the model to compress *transcript* into running notes."""
+        prompt = [
+            {"role": "system", "content": self._SUMMARY_SYSTEM},
+            {
+                "role": "user",
+                "content": f"Summarise this conversation:\n\n{transcript}",
+            },
+        ]
+        result = slot.llama.create_chat_completion(
+            prompt,
+            max_tokens=max_output,
+            temperature=0.2,
+            top_p=0.9,
+            stream=False,
+        )
+        if not isinstance(result, dict) or not result.get("choices"):
+            return ""
+        return (result["choices"][0].get("message", {}).get("content") or "").strip()
+
+    def _split_to_budget(self, transcript: str, max_tokens: int) -> "list[str]":
+        """Split *transcript* into chunks that each fit *max_tokens*.
+
+        Chunking is what keeps the *beginning* of a conversation intact. The
+        naive alternative -- trimming an over-long transcript from the front --
+        silently discards the oldest facts, which are usually the ones being
+        asked about.
+        """
+        limit = max(64, max_tokens)
+        chunks: list[str] = []
+        current: list[str] = []
+        used = 0
+        for line in transcript.splitlines():
+            if not line.strip():
+                continue
+            cost = self.count_tokens(line) + 1
+            if current and used + cost > limit:
+                chunks.append("\n".join(current))
+                current, used = [], 0
+            current.append(line)
+            used += cost
+        if current:
+            chunks.append("\n".join(current))
+        return chunks or [transcript]
+
+    def _summarize_transcript(
+        self, slot: "_ModelSlot", transcript: str, max_tokens: int
+    ) -> str:
+        """Compress *transcript* into notes that fit within *max_tokens*.
+
+        Longer conversations are compressed in stages: each chunk that fits is
+        summarised on its own, and the resulting notes are themselves
+        summarised until they fit in a single note. The number of stages is
+        bounded so a pathological conversation cannot loop.
+        """
+        chunks = self._split_to_budget(transcript, max_tokens)
+        if len(chunks) == 1:
+            return self._summarize_once(
+                slot,
+                chunks[0],
+                max_output=min(SUMMARY_OUTPUT_CEILING, max_tokens),
+            )
+
+        per_chunk = max(
+            96, min(SUMMARY_OUTPUT_CEILING, max_tokens // len(chunks))
+        )
+        notes = [
+            self._summarize_once(slot, chunk, max_output=per_chunk)
+            for chunk in chunks
+        ]
+        notes = [n for n in notes if n]
+        if not notes:
+            return ""
+
+        for _ in range(3):
+            combined = "\n".join(
+                f"[{i}] {n}" for i, n in enumerate(notes, 1)
+            )
+            if self.count_tokens(combined) <= max_tokens:
+                return combined
+            folded = self._summarize_once(
+                slot,
+                combined,
+                max_output=min(SUMMARY_OUTPUT_CEILING, max_tokens),
+            )
+            if not folded:
+                return combined
+            notes = [folded]
+
+        return "\n".join(notes)
+
+    def summarize_messages(
+        self, messages: "list[dict[str, str]]", slot: "_ModelSlot"
+    ) -> "list[dict[str, str]]":
+        """Compress *messages* so the conversation fits the context window.
+
+        Called when a prompt approaches the limit. Rather than failing, or
+        silently dropping the oldest turns, the model is asked to summarise them
+        itself and the summary takes their place, so the thread of the
+        conversation stays available to the reply.
+
+        Summarisation is best effort: if any part of it fails the original
+        messages are returned unchanged, so generation can still proceed rather
+        than failing for a secondary reason.
+        """
+        if len(messages) < 3:
+            return messages
+
+        # The recent turns are what the reply has to react to, so they are kept
+        # verbatim; everything older becomes the summary's subject.
+        budget = int(self._n_ctx * SUMMARIZED_BUDGET)
+        kept: list[dict[str, str]] = []
+        for msg in reversed(messages):
+            if kept and self._conversation_tokens(kept + [msg]) > budget:
+                break
+            kept.append(msg)
+        kept.reverse()
+
+        if len(kept) >= len(messages):
+            return messages
+        oldest = messages[: len(messages) - len(kept)]
+        if not oldest:
+            return messages
+
+        transcript = "\n\n".join(
+            f"[{m.get('role', 'user')}] "
+            + self._condense((m.get("content") or "").strip())
+            for m in oldest
+            if (m.get("content") or "").strip()
+        )
+        if not transcript.strip():
+            return messages
+
+        try:
+            # Leave room in the request for the system prompt and the reply.
+            summary_budget = max(
+                128, int(self._n_ctx * SUMMARIZE_AT) - TEMPLATE_OVERHEAD - 512
+            )
+            summary = self._summarize_transcript(
+                slot, transcript, max_tokens=summary_budget
+            )
+        except Exception as exc:
+            self._log(f"Could not summarise the conversation ({exc}); keeping it")
+            return messages
+
+        if not summary:
+            self._log("Summarisation came back empty; keeping the conversation")
+            return messages
+
+        note = {
+            "role": "system",
+            "content": (
+                "Summary of the earlier conversation, which was compressed to "
+                f"stay inside the {self._n_ctx}-token context window. Treat it "
+                "as what was already established:\n\n" + summary
+            ),
+        }
+
+        # The summary is itself text, so the tail may now have to give way to
+        # it. Trimming from the front of the tail is right here: the newest
+        # turns are the ones that must survive.
+        fitted = [note] + kept
+        limit = int(self._n_ctx * SUMMARIZE_AT)
+        while len(fitted) > 2 and self._conversation_tokens(fitted) > limit:
+            fitted.pop(1)
+
+        self._log(
+            f"Conversation near the {self._n_ctx}-token limit: summarised "
+            f"{len(oldest)} earlier message(s) into {len(summary)} characters"
+        )
+        return fitted
+
+    def _fit_to_context(
+        self, messages: "list[dict[str, str]]", slot: "_ModelSlot"
+    ) -> "tuple[list[dict[str, str]], bool]":
+        """Summarise *messages* if they no longer comfortably fit the window.
+
+        Returns the messages to send and whether anything was compressed, so
+        callers can report it without re-deriving it from lengths.
+        """
+        limit = int(self._n_ctx * SUMMARIZE_AT)
+        if self._conversation_tokens(messages) <= limit:
+            return messages, False
+        fitted = self.summarize_messages(messages, slot)
+        return fitted, fitted is not messages
+
     def create_chat_completion(
         self,
         messages: list[dict[str, str]],
@@ -555,6 +932,12 @@ class AssemblyLlama:
         effective_messages = (
             self._prepare_messages(messages) if inject_persona else messages
         )
+        effective_messages, self._last_summarized = self._fit_to_context(
+            effective_messages, slot
+        )
+        # Counted after fitting: this is what the model was actually given,
+        # which is the only figure worth reporting to a caller.
+        self._last_prompt_tokens = self._conversation_tokens(effective_messages)
         with self._lock:
             return slot.llama.create_chat_completion(effective_messages, **kwargs)
 

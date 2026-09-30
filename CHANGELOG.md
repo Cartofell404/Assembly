@@ -12,6 +12,27 @@ inside the file header, but the format may still change before 1.0.
 
 First public release.
 
+### Changed
+
+- The context window is now derived from the archive instead of being
+  configured. Every model declares its trained context length in its GGUF
+  metadata, and Assembly uses the smallest among the execution models, so a
+  request can never be sized for a model that cannot hold it. `--n-ctx` and the
+  `n_ctx` constructor argument are gone: an override could only exceed what a
+  bundled model supports, or waste what it does. Archives that declare nothing
+  usable fall back to the previous `2048`. The router's embedding model is
+  excluded on purpose -- it embeds single sentences and is usually built with a
+  tiny window, so including it would cap the whole assembly at its size.
+- Conversations approaching the window are now summarised instead of rejected.
+  Past 80% of the window Assembly asks the model to compress the earlier turns
+  and continues from that summary plus the recent exchanges. Long histories are
+  summarised in stages, so the start of a conversation survives rather than
+  being trimmed away -- trimming from the front silently discards exactly the
+  facts a question is usually about. Summarisation failing is never fatal: the
+  original history is used unchanged. Reported on stderr in the terminal and as
+  `assembly_context` in HTTP responses, so clients stop replaying turns that
+  are no longer being sent.
+
 ### Fixed
 
 - A conversation that outgrew the context window produced a `200` followed by

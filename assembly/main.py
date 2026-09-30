@@ -248,7 +248,6 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         persona=args.persona,
-        n_ctx=args.n_ctx,
         n_gpu_layers=args.n_gpu_layers,
         verbose=args.verbose,
         api_key=args.api_key,
@@ -303,8 +302,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         asmb = AssemblyLlama(
             model_path,
             persona=args.persona,
-            n_ctx=args.n_ctx,
-            n_gpu_layers=args.n_gpu_layers,
+                n_gpu_layers=args.n_gpu_layers,
             verbose=args.verbose,
             temp_dir=args.temp_dir,
         )
@@ -407,6 +405,14 @@ class _Backend:
         """Yield assistant text incrementally for *messages*."""
         raise NotImplementedError
 
+    def was_summarized(self) -> bool:
+        """Whether the last request had its history compressed."""
+        return False
+
+    def context_window(self) -> int:
+        """The context window in use, for display."""
+        return 0
+
     def route(self, text: str) -> tuple[str, float, bool]:
         """Return ``(model_name, score, is_fallback)`` without generating."""
         raise NotImplementedError
@@ -428,6 +434,12 @@ class _LocalBackend(_Backend):
     def describe(self) -> str:
         h = self.asmb.header
         return f"{h.assembly_name} · {', '.join(m.name for m in h.models)}"
+
+    def was_summarized(self) -> bool:
+        return bool(getattr(self.asmb, "_last_summarized", False))
+
+    def context_window(self) -> int:
+        return int(getattr(self.asmb, "context_window", 0) or 0)
 
     def info(self) -> dict[str, Any]:
         h = self.asmb.header
@@ -621,8 +633,19 @@ class _Chat:
         ]
 
         chunks: list[str] = []
+        announced = False
         try:
             for token in self.backend.stream(payload, self.sampling):
+                # The archive compresses history as soon as it approaches the
+                # context window. Saying so once, on the first token, keeps the
+                # answer on stdout while explaining a memory the model no
+                # longer has verbatim.
+                if not announced and self.backend.was_summarized():
+                    announced = True
+                    ui.dim(
+                        f"  ↻ earlier turns summarised to fit the "
+                        f"{self.backend.context_window():,}-token context window"
+                    )
                 chunks.append(token)
                 sys.stdout.write(token)
                 sys.stdout.flush()
@@ -1041,7 +1064,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--persona", default=None, help="Override or set assistant persona"
     )
-    p_serve.add_argument("--n-ctx", type=int, default=2048, help="Context length")
     p_serve.add_argument(
         "--n-gpu-layers", type=int, default=0, help="GPU layer offload count"
     )
@@ -1085,7 +1107,6 @@ session commands: /help /info /model /route /clear /persona /bye
         default=None,
         help="Override or set assistant persona/identity",
     )
-    p_run.add_argument("--n-ctx", type=int, default=2048, help="Context length")
     p_run.add_argument(
         "--n-gpu-layers", type=int, default=0, help="GPU layer offload count"
     )

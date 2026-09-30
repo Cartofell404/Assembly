@@ -79,7 +79,6 @@ class ModelManager:
         self,
         default_model_path: Optional[str | Path] = None,
         persona: Optional[str] = None,
-        n_ctx: int = 2048,
         n_gpu_layers: int = 0,
         verbose: bool = False,
         models_dir: Optional[str | Path] = None,
@@ -90,7 +89,6 @@ class ModelManager:
         self._models: dict[str, AssemblyLlama] = {}
         self._active_alias: Optional[str] = None
         self._persona = persona
-        self._n_ctx = n_ctx
         self._n_gpu_layers = n_gpu_layers
         self._verbose = verbose
         self._max_models = max_models
@@ -147,7 +145,6 @@ class ModelManager:
         llm = AssemblyLlama(
             asmb_path=path,
             persona=persona or self._persona,
-            n_ctx=self._n_ctx,
             n_gpu_layers=self._n_gpu_layers,
             verbose=self._verbose,
             temp_dir=self._temp_dir,
@@ -210,6 +207,35 @@ class ModelManager:
                 if name not in names:
                     names.append(name)
         return ", ".join(names) or "none loaded"
+
+    def context_window(self) -> Optional[int]:
+        """The smallest context window across every loaded model."""
+        with self._lock:
+            windows = [
+                value
+                for llm in self._models.values()
+                for value in (getattr(llm, "model_contexts", None) or {}).values()
+                if value
+            ]
+        return min(windows) if windows else None
+
+    def describe_context(self) -> str:
+        """The context window in use, and which model decided it."""
+        windows: dict[str, Optional[int]] = {}
+        for alias, llm in self._models.items():
+            contexts = getattr(llm, "model_contexts", None) or {}
+            for name, value in contexts.items():
+                windows[name] = value
+        if not windows:
+            return "none loaded"
+
+        window = self.context_window()
+        if window is None:
+            return "unknown (no model declares one)"
+
+        smallest = sorted(n for n, v in windows.items() if v == window)
+        suffix = f"  (smallest: {', '.join(smallest)})" if smallest else ""
+        return f"{window:,} tokens{suffix}"
 
     def close(self) -> None:
         with self._lock:
@@ -301,6 +327,25 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
+    def _context_note(self, llm: Any) -> dict[str, Any]:
+        """Describe the context window and whether history was compressed.
+
+        Clients that maintain conversation history need to know when the server
+        summarised it, or they will keep replaying turns that are no longer
+        being sent.
+        """
+        summarized = bool(getattr(llm, "_last_summarized", False))
+        if summarized:
+            logger.info("Request history was summarised to fit the context window")
+
+        # Only a real integer is reported. This metadata is a convenience, so a
+        # surprising value must never be allowed to fail an otherwise good
+        # response by breaking JSON serialisation.
+        window = getattr(llm, "context_window", None)
+        if not isinstance(window, int) or isinstance(window, bool):
+            window = None
+        return {"window": window, "summarized": summarized}
+
     def _send_json(
         self,
         data: Any,
@@ -389,6 +434,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "loaded_models_count": len(models),
                 "active_model": models[0]["id"] if models else None,
+                "context_window": self.server.manager.context_window(),
             })
             return
 
@@ -575,6 +621,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                         "score": round(route.score, 4),
                         "is_fallback": route.is_fallback,
                     }
+                    resp["assembly_context"] = self._context_note(llm)
                 self._send_json(resp)
             else:
                 content = ""
@@ -582,12 +629,15 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                     content = (
                         resp["choices"][0].get("message", {}).get("content", "")
                     )
+                note = self._context_note(llm)
                 self._send_json({
                     "model": f"{alias}:{route.model_name}",
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "message": {"role": "assistant", "content": content},
                     "done": True,
                     "routed_model": route.model_name,
+                    "context_window": note["window"],
+                    "summarized": note["summarized"],
                 })
         except Exception as exc:
             # An over-long conversation is the caller's problem to fix, not a
@@ -767,7 +817,6 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
     persona: Optional[str] = None,
-    n_ctx: int = 2048,
     n_gpu_layers: int = 0,
     verbose: bool = False,
     api_key: Optional[str] = None,
@@ -793,7 +842,6 @@ def serve(
     manager = ModelManager(
         default_model_path=model_path,
         persona=persona,
-        n_ctx=n_ctx,
         n_gpu_layers=n_gpu_layers,
         verbose=verbose,
         models_dir=models_dir,
@@ -810,6 +858,7 @@ def serve(
     rows: list[tuple[str, str]] = [
         ("Archive", Path(model_path).name if model_path else "none — waiting for /api/load"),
         ("Models", manager.describe_models()),
+        ("Context", manager.describe_context()),
         ("Auth", "bearer token required" if api_key else "none (loopback only)"),
     ]
     if models_dir:

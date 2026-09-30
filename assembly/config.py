@@ -235,18 +235,21 @@ def gguf_split_info(path: pathlib.Path) -> tuple[Optional[int], Optional[int]]:
     return gguf_split_info_from_bytes(head)
 
 
-def gguf_split_info_from_bytes(head: bytes) -> tuple[Optional[int], Optional[int]]:
-    """Return ``(split_count, split_no)`` from the first bytes of a GGUF.
+def gguf_metadata_from_bytes(
+    head: bytes, wanted: "set[str] | frozenset[str]"
+) -> "dict[str, Any]":
+    """Return selected scalar GGUF metadata values from the first bytes.
 
-    Large models are often published as shards (``model-00001-of-00003.gguf``).
-    llama.cpp refuses to load any shard whose metadata declares it is part of a
-    split, so such a file can be copied into an archive and byte-verified
-    perfectly and still be unloadable at runtime. Detecting it early turns a
-    multi-gigabyte staging attempt followed by a confusing failure into an
-    immediate, actionable error.
+    GGUF stores its key/value metadata ahead of the tensor data, so the values
+    of interest live in the first few hundred kilobytes of a model file. That
+    makes them cheap to read straight out of an archive without mapping or
+    loading anything.
 
-    Returns ``(None, None)`` when the bytes have no split metadata or cannot be
-    parsed; callers must treat that as "not checked", never as "invalid".
+    Only scalar values (integers, floats, booleans, strings) are returned.
+    Arrays are skipped, because the caller wants things like
+    ``general.context_length`` and walking a token list would be pointless.
+    Anything unparseable yields a partial or empty dict: callers treat absence
+    as "not checked", never as "invalid".
     """
     import io
 
@@ -255,7 +258,7 @@ def gguf_split_info_from_bytes(head: bytes) -> tuple[Optional[int], Optional[int
 
     fh = io.BytesIO(head)
 
-    def read_str() -> None:
+    def read_str() -> str:
         raw = fh.read(8)
         if len(raw) < 8:
             raise ValueError("truncated")
@@ -289,47 +292,160 @@ def gguf_split_info_from_bytes(head: bytes) -> tuple[Optional[int], Optional[int
         else:
             raise ValueError("unknown value type")
 
+    def scalar(t: int) -> Any:
+        if t == 8:
+            return read_str()
+        if t == 7:
+            raw = fh.read(1)
+            if len(raw) < 1:
+                raise ValueError("truncated")
+            return raw[0] != 0
+        width = fixed.get(t)
+        if width is None:
+            raise ValueError("not a scalar")
+        raw = fh.read(width)
+        if len(raw) < width:
+            raise ValueError("truncated")
+        if t == 6:
+            (value,) = struct.unpack("<f", raw)
+        elif t == 12:
+            (value,) = struct.unpack("<d", raw)
+        else:
+            value = int.from_bytes(raw, "little", signed=t in (1, 3, 5, 11))
+        return value
+
+    out: dict[str, Any] = {}
     try:
         if fh.read(4) != b"GGUF":
-            return (None, None)
+            return out
         if len(fh.read(4)) < 4:
-            return (None, None)
+            return out
         _, n_kv = struct.unpack("<QQ", fh.read(16))
 
-        split_count: Optional[int] = None
-        split_no: Optional[int] = None
         for _ in range(n_kv):
             key_start = fh.tell()
             raw = fh.read(8)
             if len(raw) < 8:
-                return (None, None)
+                return out
             (klen,) = struct.unpack("<Q", raw)
             if klen > 4096:
-                return (None, None)
+                return out
             key_raw = fh.read(klen)
             if len(key_raw) < klen:
-                return (None, None)
+                return out
             key = key_raw.decode("utf-8", "replace")
             (vtype,) = struct.unpack("<I", fh.read(4))
 
-            if key in ("split.count", "split.no"):
-                width = fixed.get(vtype)
-                if width is None:
-                    return (None, None)
-                raw_value = fh.read(width)
-                if len(raw_value) < width:
-                    return (None, None)
-                value = int.from_bytes(raw_value, "little", signed=vtype in (1, 3, 5, 11))
-                if key == "split.count":
-                    split_count = value
-                else:
-                    split_no = value
+            if key in wanted and key not in out:
+                try:
+                    out[key] = scalar(vtype)
+                except (ValueError, struct.error):
+                    return out
             else:
                 fh.seek(key_start + 8 + klen + 4, os.SEEK_SET)
                 skip_value(vtype)
-        return (split_count, split_no)
+            if len(out) == len(wanted):
+                return out
+        return out
     except (struct.error, ValueError, UnicodeError):
+        return out
+
+
+def gguf_context_length_from_bytes(head: bytes) -> Optional[int]:
+    """Return the trained context length declared by a GGUF header.
+
+    GGUF namespaces most keys by architecture, so the field is
+    ``llama.context_length`` for a Llama model and ``qwen2.context_length``
+    for Qwen2 -- not a single fixed key name. The architecture is read first,
+    then its own field is preferred, with a scan for any ``*.context_length``
+    as a fallback for architectures this build has not seen.
+
+    Returns ``None`` when the file declares no usable value, which callers must
+    treat as "unknown", never as "zero".
+    """
+    meta = gguf_metadata_from_bytes(head, {"general.architecture"})
+    arch = meta.get("general.architecture")
+    if isinstance(arch, str) and arch:
+        found = gguf_metadata_from_bytes(head, {f"{arch}.context_length"})
+        value = found.get(f"{arch}.context_length")
+        if isinstance(value, int) and value > 0:
+            return value
+
+    # Unknown architecture: look for any namespaced context_length at all.
+    try:
+        import io as _io
+
+        fixed = {0: 1, 1: 1, 7: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 10: 8, 11: 8, 12: 8}
+        fh = _io.BytesIO(head)
+        fh.read(4)
+        if len(fh.read(4)) < 4:
+            return None
+        _, n_kv = struct.unpack("<QQ", fh.read(16))
+        for _ in range(n_kv):
+            key_start = fh.tell()
+            raw = fh.read(8)
+            if len(raw) < 8:
+                return None
+            (klen,) = struct.unpack("<Q", raw)
+            if klen > 4096:
+                return None
+            key_raw = fh.read(klen)
+            if len(key_raw) < klen:
+                return None
+            key = key_raw.decode("utf-8", "replace")
+            (vtype,) = struct.unpack("<I", fh.read(4))
+            if key.endswith(".context_length") and vtype in fixed:
+                width = fixed[vtype]
+                blob = fh.read(width)
+                if len(blob) < width:
+                    return None
+                value = int.from_bytes(blob, "little", signed=vtype in (1, 3, 5, 11))
+                return value if value > 0 else None
+            fh.seek(key_start + 8 + klen + 4, os.SEEK_SET)
+            # Skip without interpreting: the helper above cannot be reused
+            # here because it only returns requested keys.
+            if vtype == 8:
+                (n,) = struct.unpack("<Q", fh.read(8))
+                fh.seek(n, os.SEEK_CUR)
+            elif vtype == 9:
+                (elem,) = struct.unpack("<I", fh.read(4))
+                (count,) = struct.unpack("<Q", fh.read(8))
+                if elem == 8:
+                    for _ in range(count):
+                        (n,) = struct.unpack("<Q", fh.read(8))
+                        fh.seek(n, os.SEEK_CUR)
+                elif elem in fixed:
+                    fh.seek(fixed[elem] * count, os.SEEK_CUR)
+                else:
+                    return None
+            elif vtype in fixed:
+                fh.seek(fixed[vtype], os.SEEK_CUR)
+            else:
+                return None
+    except (struct.error, ValueError, UnicodeError):
+        return None
+    return None
+
+
+def gguf_split_info_from_bytes(head: bytes) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(split_count, split_no)`` from the first bytes of a GGUF.
+
+    Large models are often published as shards (``model-00001-of-00003.gguf``).
+    llama.cpp refuses to load any shard whose metadata declares it is part of a
+    split, so such a file can be copied into an archive and byte-verified
+    perfectly and still be unloadable at runtime. Detecting it early turns a
+    multi-gigabyte staging attempt followed by a confusing failure into an
+    immediate, actionable error.
+
+    Returns ``(None, None)`` when the bytes have no split metadata or cannot be
+    parsed; callers must treat that as "not checked", never as "invalid".
+    """
+    meta = gguf_metadata_from_bytes(head, {"split.count", "split.no"})
+    count = meta.get("split.count")
+    no = meta.get("split.no")
+    if not isinstance(count, int) or not isinstance(no, int):
         return (None, None)
+    return (count, no)
 
 
 def _check_not_sharded(
