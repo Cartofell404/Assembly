@@ -195,6 +195,25 @@ out, and the number of concurrently loaded models is bounded.
 | `--allow-origin ORIGIN` | Allow one CORS origin, e.g. `http://localhost:5173`. Omitted by default: no browser origin may call the server |
 | `--models-dir DIR` | Confine the `/api/load` endpoint to `.asmb` files inside `DIR` |
 | `--temp-dir DIR` | Where model blobs are staged on macOS (see below) |
+| `--n-ctx N` | Context window per model, default `2048`. Raise it if long conversations overflow (see below) |
+
+#### Context window
+
+Every loaded model gets `--n-ctx` tokens to work with, and the persona plus the
+whole message history have to fit inside it. When a conversation outgrows the
+window, the server says so plainly and returns `400` — including on streaming
+requests, which are checked before any part of the response is sent:
+
+```json
+{"error": {"message": "Conversation is too long for the context window:
+2087 tokens against a limit of 2048. Start a new conversation, shorten the
+history, or restart the server with a larger window (e.g. --n-ctx 4096).",
+"code": 400}}
+```
+
+Either start a new conversation, or restart with a bigger window. Models vary in
+how much context they can hold, so give `--n-ctx` a value no larger than the
+smallest model in the archive supports.
 
 CORS is off by default on purpose. Enable a single specific origin only if a
 browser client needs it; do not use `*` on a network-exposed server.

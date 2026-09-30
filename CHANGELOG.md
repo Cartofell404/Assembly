@@ -14,6 +14,16 @@ First public release.
 
 ### Fixed
 
+- A conversation that outgrew the context window produced a `200` followed by
+  an SSE error frame, and printed a full traceback to the server console.
+  llama-cpp-python tokenises lazily, on the first advance of the streaming
+  generator, so the failure surfaced after the status line had already gone
+  out. The stream is now primed with one `next()` before the headers are sent,
+  which turns a too-long conversation into a `400` with both token counts and
+  the two remedies. The non-streaming endpoints report the same way instead of
+  a bare `500`.
+- Routine context overflows no longer log a stack trace; only genuinely
+  unexpected failures do.
 - `assembly serve` crashed with `KeyError: 'name'` while printing its startup
   banner, immediately after finishing a multi-gigabyte archive load. The row
   read a `name` key from `ModelManager.list_models()`, whose entries are keyed

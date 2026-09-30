@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 import secrets
 import sys
@@ -218,6 +219,29 @@ class ModelManager:
                 except Exception:
                     pass
             self._models.clear()
+
+
+def _context_overflow(exc: Exception) -> str | None:
+    """Turn llama.cpp's context-window error into something actionable.
+
+    llama.cpp raises a bare ``ValueError`` when the prompt does not fit. The
+    raw text ("Requested tokens (2082) exceed context window of 2048") is
+    accurate but leaves the reader guessing what to do, so it is restated with
+    the two remedies we actually support.
+    """
+    match = re.search(
+        r"Requested tokens \((\d+)\) exceed context window of (\d+)",
+        str(exc),
+    )
+    if not match:
+        return None
+    requested, limit = int(match.group(1)), int(match.group(2))
+    return (
+        f"Conversation is too long for the context window: {requested} tokens "
+        f"against a limit of {limit}. Start a new conversation, shorten the "
+        f"history, or restart the server with a larger window "
+        f"(e.g. --n-ctx {max(limit * 2, 4096)})."
+    )
 
 
 class AssemblyRequestHandler(BaseHTTPRequestHandler):
@@ -566,8 +590,17 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                     "routed_model": route.model_name,
                 })
         except Exception as exc:
-            logger.warning("Chat completion failed: %s", exc)
-            self._send_error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
+            # An over-long conversation is the caller's problem to fix, not a
+            # server fault, so it gets a 400 with a usable explanation.
+            overflow = _context_overflow(exc)
+            if overflow:
+                logger.warning("Context window exceeded: %s", overflow)
+                self._send_error(overflow, HTTPStatus.BAD_REQUEST)
+            else:
+                logger.warning("Chat completion failed: %s", exc)
+                self._safe_error(
+                    str(exc), HTTPStatus.INTERNAL_SERVER_ERROR
+                )
 
     def _stream_sse(
         self,
@@ -579,11 +612,40 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Stream an OpenAI-compatible SSE response.
 
-        Once the headers are on the wire we can no longer send an HTTP error,
-        so failures are reported as an SSE ``error`` frame followed by
-        ``[DONE]`` — the client sees a failure rather than a silent, empty
-        "success".
+        The generator is primed with one ``next()`` *before* the headers go
+        out. llama-cpp-python is lazy: it tokenises on the first advance of the
+        generator, so a prompt that cannot fit the context window only fails at
+        that point. Priming first means the client gets a real 400 with an
+        explanation instead of a 200 followed by an error frame.
+
+        Once the headers are on the wire no HTTP error is possible, so any
+        later failure is reported as an SSE ``error`` frame plus ``[DONE]``.
         """
+        gen = llm.create_chat_completion(
+            messages=messages,
+            stream=True,
+            **sampling.to_llama_kwargs(),
+        )
+        first_chunk: dict[str, Any] | None
+        try:
+            first_chunk = next(gen)
+        except StopIteration:
+            first_chunk = None
+        except Exception as exc:
+            # Nothing has been written yet, so a proper HTTP error still fits.
+            gen.close()
+            overflow = _context_overflow(exc)
+            if overflow:
+                logger.warning("Context window exceeded: %s", overflow)
+                self._send_error(overflow, HTTPStatus.BAD_REQUEST)
+            else:
+                logger.exception("Streaming setup failed")
+                self._safe_error(
+                    f"generation failed: {type(exc).__name__}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return
+
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -603,12 +665,10 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
 
         model_label = f"{alias}:{route.model_name}"
         try:
-            gen = llm.create_chat_completion(
-                messages=messages,
-                stream=True,
-                **sampling.to_llama_kwargs(),
-            )
-            for chunk in gen:
+            # Replay the chunk that was pulled while priming.
+            chunks = [] if first_chunk is None else [first_chunk]
+            chunks.extend(gen)
+            for chunk in chunks:
                 # llama-cpp-python 0.2.x appends a bare "[DONE]" string;
                 # serialising that would emit a second, bogus sentinel.
                 if not isinstance(chunk, dict):
@@ -619,8 +679,14 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                     gen.close()
                     return
         except Exception as exc:
-            logger.exception("Streaming failed")
-            emit(f"data: {json.dumps({'error': {'message': f'generation failed: {type(exc).__name__}'}})}\n\n")
+            overflow = _context_overflow(exc)
+            if overflow:
+                logger.warning("Streaming failed: %s", overflow)
+                message = overflow
+            else:
+                logger.exception("Streaming failed")
+                message = f"generation failed: {type(exc).__name__}"
+            emit(f"data: {json.dumps({'error': {'message': message}})}\n\n")
 
         emit("data: [DONE]\n\n")
 
@@ -664,7 +730,13 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                     "routed_model": route.model_name,
                 })
         except Exception as exc:
-            self._send_error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
+            overflow = _context_overflow(exc)
+            if overflow:
+                logger.warning("Context window exceeded: %s", overflow)
+                self._send_error(overflow, HTTPStatus.BAD_REQUEST)
+            else:
+                logger.warning("Completion failed: %s", exc)
+                self._safe_error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def log_message(self, format: str, *args: Any) -> None:
         """Custom clean logging."""

@@ -1905,6 +1905,135 @@ class TestDescribeModels:
         assert "Code, General, Reasoning" in out
 
 
+class TestContextOverflow:
+    """A conversation that outgrows the context window must fail cleanly.
+
+    llama.cpp raises a bare ValueError, and llama-cpp-python raises it lazily,
+    on the first advance of the generator rather than when it is created. That
+    used to arrive after a 200 had already been written.
+    """
+
+    OVERFLOW = ("Requested tokens (2082) exceed context window of 2048")
+
+    def _llm(self, streaming: bool):
+        from assembly.wrapper import RouteResult
+        from unittest.mock import MagicMock
+
+        llm = MagicMock()
+        llm.header.assembly_name = "TestAssembly"
+        llm.header.models = []
+        llm.route.return_value = RouteResult(
+            model_name="coder", model_index=0, score=0.9, is_fallback=False
+        )
+
+        def overflow():
+            # Mirrors llama-cpp-python: nothing happens until it is advanced.
+            raise ValueError(self.OVERFLOW)
+            yield  # pragma: no cover
+
+        if streaming:
+            llm.create_chat_completion.return_value = overflow()
+        else:
+            llm.create_chat_completion.side_effect = ValueError(self.OVERFLOW)
+            llm.side_effect = ValueError(self.OVERFLOW)
+        return llm
+
+    def _manager(self, llm):
+        from assembly.server import ModelManager
+
+        mgr = ModelManager()
+        mgr._models["a"] = llm
+        mgr._active_alias = "a"
+        return mgr
+
+    def _post(self, llm, path="/v1/chat/completions", body=None):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        payload = json.dumps(body if body is not None else {
+            "messages": [{"role": "user", "content": "hi"}]
+        }).encode()
+        sock = MockSocket(
+            f"POST {path} HTTP/1.1\r\nHost: localhost\r\n".encode()
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        mock_server = MagicMock()
+        mock_server.manager = self._manager(llm)
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        raw = sock.get_output()
+        header, _, rest = raw.partition(b"\r\n\r\n")
+        status = int(header.decode("utf-8").splitlines()[0].split()[1])
+        return status, header.decode("utf-8"), rest
+
+    def test_message_is_recognised(self):
+        from assembly.server import _context_overflow
+
+        msg = _context_overflow(ValueError(self.OVERFLOW))
+        assert msg is not None
+        assert "2082" in msg and "2048" in msg
+
+    def test_message_names_both_remedies(self):
+        from assembly.server import _context_overflow
+
+        msg = _context_overflow(ValueError(self.OVERFLOW))
+        assert "new conversation" in msg.lower()
+        assert "--n-ctx" in msg
+
+    def test_unrelated_error_is_not_mistaken_for_overflow(self):
+        from assembly.server import _context_overflow
+
+        assert _context_overflow(ValueError("model failed to load")) is None
+
+    def test_non_streaming_returns_400(self):
+        status, _, body = self._post(self._llm(streaming=False))
+        assert status == 400
+        assert "2082" in body.decode("utf-8")
+
+    def test_streaming_returns_400_not_200(self):
+        """Regression: this used to report 200 and then fail mid-stream."""
+        status, header, body = self._post(self._llm(streaming=True),
+                                          body={"messages": [{"role": "user", "content": "hi"}],
+                                                "stream": True})
+        assert status == 400
+        assert "text/event-stream" not in header.lower()
+        assert b"2082" in body
+
+    def test_streaming_overflow_sends_no_sse_frames(self):
+        _status, _header, body = self._post(
+            self._llm(streaming=True),
+            body={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert b"data:" not in body
+        assert b"[DONE]" not in body
+
+    def test_no_traceback_on_a_routine_overflow(self, caplog):
+        """A too-long conversation must not dump a stack trace on the server."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="assembly.server"):
+            self._post(self._llm(streaming=False))
+        assert not any(r.exc_info for r in caplog.records)
+
+    def test_ollama_chat_also_returns_400(self):
+        status, _, body = self._post(self._llm(streaming=False), path="/api/chat")
+        assert status == 400
+
+    def test_legacy_completions_returns_400(self):
+        status, _, body = self._post(self._llm(streaming=False),
+                                     path="/v1/completions",
+                                     body={"prompt": "hi"})
+        assert status == 400
+
+    def test_ollama_generate_returns_400(self):
+        status, _, body = self._post(self._llm(streaming=False),
+                                     path="/api/generate",
+                                     body={"prompt": "hi"})
+        assert status == 400
+
+
 # ── Staging directory ─────────────────────────────────────────────────
 
 class TestStaging:
