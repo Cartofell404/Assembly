@@ -154,6 +154,75 @@ def rule(width: int = 60) -> None:
     err.print(Text("─" * width, style=ORANGE_DEEP))
 
 
+def meter(
+    label: str,
+    value: float,
+    low: float,
+    high: float,
+    *,
+    suffix: str = "",
+    width: int = 24,
+    marker: str | None = None,
+) -> None:
+    """One labelled bar showing where ``value`` sits in ``[low, high]``.
+
+    The bar is the point: a number like ``0.8`` is hard to judge in isolation,
+    whereas a bar makes "half way up the temperature range" obvious at a
+    glance. Filled cells use the bright brand colour and the remainder fades,
+    so the orange stays dominant without shouting.
+    """
+    span = (high - low) or 1.0
+
+    # A range that straddles zero gets a centre-anchored bar, because filling
+    # from the left would make a neutral 0.0 look half-applied and would hide
+    # the sign of the value.
+    signed = low < 0.0 < high
+
+    if marker is not None:
+        # A preset/target tick, so "where am I vs where I want to be" is visible.
+        target = max(0.0, min(1.0, (marker - low) / span))
+        target_at = int(round(target * width))
+    else:
+        target_at = -1
+
+    if signed:
+        centre = int(round(((0.0 - low) / span) * width))
+        centre = max(0, min(width - 1, centre))
+        at = max(0, min(width, int(round(((value - low) / span) * width))))
+        bar = Text()
+        for i in range(width):
+            if i == centre and not (min(at, centre) <= i < max(at, centre)):
+                bar.append("│", style=MUTED)
+            elif min(at, centre) <= i < max(at, centre):
+                bar.append("█", style=ORANGE_LIT)
+            else:
+                bar.append("·", style=ORANGE_DEEP)
+    else:
+        fraction = max(0.0, min(1.0, (value - low) / span))
+        filled = int(round(fraction * width))
+        filled = max(1 if width else 0, filled)  # show at least one cell
+
+        bar = Text()
+        for i in range(width):
+            if i == target_at and i != filled:
+                bar.append("│", style=MUTED)
+            elif i < filled:
+                bar.append("█", style=ORANGE_LIT)
+            else:
+                bar.append("·", style=ORANGE_DEEP)
+
+    shown = (
+        f"{value:.2f}".rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
+    )
+    err.print(
+        Text.assemble(
+            (f"  {label:<16}", CREAM),
+            bar,
+            (f"  {shown}{suffix}", ORANGE_LIT),
+        )
+    )
+
+
 def banner(title: str, subtitle: str, rows: Sequence[tuple[str, str]]) -> None:
     """The header shown when the server starts.
 

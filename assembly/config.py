@@ -772,3 +772,181 @@ def validate_assembly_preflight(
         models_info=models_info,
         config=cfg,
     )
+
+
+# ── Sampling ───────────────────────────────────────────────────────────────
+# Generation knobs, shared by the HTTP server and the interactive CLI so that
+# `/temp 1.2` and a client's `{"temperature": 1.2}` mean exactly the same
+# thing.
+#
+# OpenAI's names are the common denominator, plus `top_k` as a llama.cpp/Ollama
+# extension OpenAI does not have. llama.cpp implements repeat, presence and
+# frequency penalties as three independent knobs, so all three are kept apart
+# rather than folded together. Values arriving from a client are clamped rather
+# than rejected — a client sending `frequency_penalty: 3.0` should get a
+# working answer, not a 400.
+
+
+@dataclass
+class SamplingParams:
+    """Sampler settings for one generation.
+
+    Defaults are llama.cpp's own defaults, which are sane for instruct models.
+    """
+
+    temperature: float = 0.8
+    top_p: float = 0.95
+    top_k: int = 40
+    repeat_penalty: float = 1.1
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    max_tokens: int = 512
+    stop: list[str] = field(default_factory=list)
+    seed: Optional[int] = None
+
+    def to_llama_kwargs(self) -> dict[str, Any]:
+        """The subset llama-cpp-python's ``create_chat_completion`` accepts."""
+        out: dict[str, Any] = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "max_tokens": self.max_tokens,
+        }
+        if self.stop:
+            out["stop"] = list(self.stop)
+        if self.seed is not None:
+            out["seed"] = self.seed
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "max_tokens": self.max_tokens,
+            "stop": list(self.stop),
+            "seed": self.seed,
+        }
+
+
+# Named bundles. `precise` is for code and factual work where a stray token
+# ruins the answer; `creative` is for prose and brainstorming.
+SAMPLING_PRESETS: dict[str, dict[str, Any]] = {
+    "precise": {
+        "temperature": 0.2, "top_p": 0.90, "top_k": 20,
+        "repeat_penalty": 1.05, "max_tokens": 1024,
+        "presence_penalty": 0.0, "frequency_penalty": 0.0,
+    },
+    "balanced": {
+        "temperature": 0.8, "top_p": 0.95, "top_k": 40,
+        "repeat_penalty": 1.10, "max_tokens": 512,
+        "presence_penalty": 0.0, "frequency_penalty": 0.0,
+    },
+    "creative": {
+        "temperature": 1.2, "top_p": 0.98, "top_k": 80,
+        "repeat_penalty": 1.15, "max_tokens": 512,
+        "presence_penalty": 0.0, "frequency_penalty": 0.0,
+    },
+}
+
+# Display metadata: label, valid range, and how to format the number.
+SAMPLING_FIELDS: dict[str, tuple[str, float, float]] = {
+    "temperature": ("temperature", 0.0, 2.0),
+    "top_p": ("top_p", 0.0, 1.0),
+    "top_k": ("top_k", 1.0, 100.0),
+    "repeat_penalty": ("repeat penalty", 1.0, 2.0),
+    "presence_penalty": ("presence pen", -2.0, 2.0),
+    "frequency_penalty": ("frequency pen", -2.0, 2.0),
+    "max_tokens": ("max tokens", 16.0, 8192.0),
+}
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _coerce_float(value: Any, low: float, high: float) -> float | None:
+    """Read a float, clamping to the range, or ``None`` if unusable.
+
+    Returning ``None`` matters: a client sending ``temperature: "hot"`` should
+    keep the default, not silently become fully deterministic (``0.0``), which
+    is a subtle and confusing way to change how a model behaves.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return _clamp(number, low, high)
+
+
+def sampling_params_from_body(
+    body: dict[str, Any], base: SamplingParams | None = None
+) -> SamplingParams:
+    """Build sampler settings from a request body, over ``base``.
+
+    Accepts OpenAI's names plus llama.cpp's ``top_k``. Each penalty is kept as
+    its own knob, because llama.cpp implements all three independently.
+    """
+    params = base.to_dict() if base else SamplingParams().to_dict()
+    stop = list(params["stop"])
+
+    def take(key: str, attr: str, low: float, high: float, cast: Any = float) -> None:
+        if key not in body:
+            return
+        number = _coerce_float(body[key], low, high)
+        if number is not None:
+            params[attr] = cast(number)
+
+    take("temperature", "temperature", 0.0, 2.0)
+    take("top_p", "top_p", 0.0, 1.0)
+    take("top_k", "top_k", 1.0, 100.0, int)
+    take("max_tokens", "max_tokens", 16.0, 8192.0, int)
+    # Newer/alternative spellings of the token budget.
+    for key in ("max_completion_tokens", "max_new_tokens"):
+        take(key, "max_tokens", 16.0, 8192.0, int)
+
+    if body.get("seed") is not None:
+        try:
+            params["seed"] = int(body["seed"])
+        except (TypeError, ValueError):
+            params["seed"] = None
+
+    # llama.cpp exposes all three penalties, so they stay independent. OpenAI's
+    # presence/frequency penalties run -2.0..2.0; repeat_penalty is a multiplier
+    # that only makes sense above 1.0.
+    take("repeat_penalty", "repeat_penalty", 1.0, 2.0)
+    take("presence_penalty", "presence_penalty", -2.0, 2.0)
+    take("frequency_penalty", "frequency_penalty", -2.0, 2.0)
+
+    raw_stop = body.get("stop")
+    if isinstance(raw_stop, str):
+        stop = [raw_stop]
+    elif isinstance(raw_stop, list):
+        stop = [str(s) for s in raw_stop if isinstance(s, (str, int, float))]
+
+    return SamplingParams(
+        temperature=float(params["temperature"]),
+        top_p=float(params["top_p"]),
+        top_k=int(params["top_k"]),
+        repeat_penalty=float(params["repeat_penalty"]),
+        presence_penalty=float(params["presence_penalty"]),
+        frequency_penalty=float(params["frequency_penalty"]),
+        max_tokens=int(params["max_tokens"]),
+        stop=stop,
+        seed=params["seed"],
+    )
+
+
+def sampling_params_from_preset(name: str) -> SamplingParams:
+    """Look up a named preset. Raises ``KeyError`` on an unknown name."""
+    return SamplingParams(**SAMPLING_PRESETS[name.lower()])

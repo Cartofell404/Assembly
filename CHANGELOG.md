@@ -62,6 +62,16 @@ First public release.
 
 ### Added
 
+- Configurable sampling. `/params` shows temperature, top-p, top-k, repeat
+  penalty, presence penalty, frequency penalty and the token budget as bars;
+  each can be set individually (`/temp 1.2`, `/frequency -0.4`, `/max 1024`,
+  `/stop END`) or chosen as a `precise` / `balanced` / `creative` preset.
+  Values are clamped rather than rejected and decimal commas are accepted.
+- The OpenAI-compatible endpoints now honour `temperature`, `top_p`, `top_k`,
+  `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `max_tokens`,
+  `stop` and `seed` on both `/v1/chat/completions` and `/v1/completions`, for
+  streaming and non-streaming requests alike. Unusable values fall back to the
+  default instead of failing the request.
 - `assembly build` packs an embedding model and two or more execution models
   into a single `.asmb` archive, with anchor embeddings pre-computed at build
   time so routing needs no Python model at inference.

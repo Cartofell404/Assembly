@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from assembly import __version__, ui
+from assembly.config import SamplingParams, sampling_params_from_body
 from assembly.wrapper import AssemblyLlama
 
 logger = logging.getLogger("assembly.server")
@@ -501,8 +502,10 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
             return
 
         req_model = body.get("model")
-        max_tokens = body.get("max_tokens", 512)
-        temperature = body.get("temperature", 0.7)
+        # Read every sampler knob the client sent, not just temperature and
+        # max_tokens. Values are clamped rather than rejected, so a client
+        # asking for something out of range still gets an answer.
+        sampling = sampling_params_from_body(body)
         stream_requested = bool(body.get("stream", False))
 
         try:
@@ -516,15 +519,14 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
 
             # SSE Streaming support for OpenAI clients
             if stream_requested and is_openai:
-                self._stream_sse(alias, llm, route, messages, max_tokens, temperature)
+                self._stream_sse(alias, llm, route, messages, sampling)
                 return
 
             # Non-streaming standard response
             resp = llm.create_chat_completion(
                 messages=messages,
                 stream=False,
-                max_tokens=max_tokens,
-                temperature=temperature,
+                **sampling.to_llama_kwargs(),
             )
 
             if is_openai:
@@ -559,8 +561,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
         llm: Any,
         route: Any,
         messages: list[dict[str, Any]],
-        max_tokens: int,
-        temperature: float,
+        sampling: SamplingParams,
     ) -> None:
         """Stream an OpenAI-compatible SSE response.
 
@@ -591,8 +592,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
             gen = llm.create_chat_completion(
                 messages=messages,
                 stream=True,
-                max_tokens=max_tokens,
-                temperature=temperature,
+                **sampling.to_llama_kwargs(),
             )
             for chunk in gen:
                 # llama-cpp-python 0.2.x appends a bare "[DONE]" string;
@@ -617,8 +617,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
             return
 
         req_model = body.get("model")
-        max_tokens = body.get("max_tokens", 256)
-        temperature = body.get("temperature", 0.7)
+        sampling = sampling_params_from_body(body, base=SamplingParams(max_tokens=256))
 
         try:
             alias, llm = self.server.manager.get_active(req_model)
@@ -626,8 +625,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
 
             resp = llm(
                 prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
+                **sampling.to_llama_kwargs(),
             )
 
             if is_openai:

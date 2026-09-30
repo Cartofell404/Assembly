@@ -245,8 +245,60 @@ Type `/help` for the command list:
 | `/model` | models in the assembly and which are loaded |
 | `/route <text>` | show which model *would* answer, without generating |
 | `/persona` | show the active persona |
+| `/params` | sampling settings, drawn as bars |
+| `/temp <n>` | randomness, `0.0`–`2.0` |
+| `/top_p <n>` | nucleus sampling, `0.0`–`1.0` |
+| `/top_k <n>` | top-k cutoff, `1`–`100` |
+| `/repeat <n>` | repeat penalty, `1.0`–`2.0` |
+| `/presence <n>` | presence penalty, `-2.0`–`2.0` |
+| `/frequency <n>` | frequency penalty, `-2.0`–`2.0` |
+| `/max <n>` | max tokens per reply, `16`–`8192` |
+| `/stop <text>` | stop sequence (`/stop clear` to remove) |
+| `/preset <name>` | `precise`, `balanced`, or `creative` |
 | `/clear` | forget the conversation |
 | `/bye` | exit (also `Ctrl+C` / `Ctrl+D`) |
+
+### Sampling
+
+`/params` shows the current settings as bars, so you can see at a glance how far
+a value sits in its range. Anything not matching the `balanced` preset is
+labelled:
+
+```
+▸ /params
+  temperature     ██████████··············  0.8
+  top_p           ███████████████████████·  0.95
+  top_k           █████████···············  40
+  repeat penalty  ██······················  1.1
+  presence pen    ············│···········  0
+  frequency pen   ············│···········  0
+  max tokens      █·······················  512
+  stop            (none)
+```
+
+Values are clamped to their range rather than rejected, and decimal commas work
+(`/temp 1,6`). Presets are just bundles:
+
+| Preset | Use it for |
+|---|---|
+| `precise` | code and factual work; low temperature, longer answers |
+| `balanced` | the default for chat |
+| `creative` | prose and brainstorming |
+
+The same settings are accepted by the HTTP API on `/v1/chat/completions` and
+`/v1/completions`, using OpenAI's names plus llama.cpp's `top_k`:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"assembly","messages":[{"role":"user","content":"hi"}],
+       "temperature":0.2,"top_p":0.9,"top_k":20,"max_tokens":1024,
+       "presence_penalty":0.5,"frequency_penalty":0.5,"stop":["\n\n"]}'
+```
+
+Unsupported values fall back to the default rather than failing the request, so
+a client sending `temperature: "hot"` still gets an answer. `seed` is passed
+through when present, which makes runs reproducible.
 
 `Ctrl+C` during a reply stops generating but keeps the session open. Progress
 (archive loading, sub-model warm-up) goes to stderr, so piping stdout gives you

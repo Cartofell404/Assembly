@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from assembly import __version__, ui
+from assembly.config import (
+    SAMPLING_FIELDS,
+    SAMPLING_PRESETS,
+    SamplingParams,
+    sampling_params_from_preset,
+)
 from assembly.header import InvalidArchiveError
 
 
@@ -395,7 +401,9 @@ class _Backend:
         """Short human label, e.g. ``Mesh 1.0 · Code, General, Reasoning``."""
         raise NotImplementedError
 
-    def stream(self, messages: list[dict[str, str]], max_tokens: int) -> Iterator[str]:
+    def stream(
+        self, messages: list[dict[str, str]], sampling: "SamplingParams"
+    ) -> Iterator[str]:
         """Yield assistant text incrementally for *messages*."""
         raise NotImplementedError
 
@@ -451,9 +459,11 @@ class _LocalBackend(_Backend):
         with ui.status(f"loading {name}"):
             self.asmb.warm(name)
 
-    def stream(self, messages: list[dict[str, str]], max_tokens: int) -> Iterator[str]:
+    def stream(
+        self, messages: list[dict[str, str]], sampling: SamplingParams
+    ) -> Iterator[str]:
         gen = self.asmb.create_chat_completion(
-            messages, stream=True, max_tokens=max_tokens
+            messages, stream=True, **sampling.to_llama_kwargs()
         )
         for chunk in gen:
             if not isinstance(chunk, dict):
@@ -528,14 +538,16 @@ class _ServerBackend(_Backend):
             bool(route.get("is_fallback", False)),
         )
 
-    def stream(self, messages: list[dict[str, str]], max_tokens: int) -> Iterator[str]:
+    def stream(
+        self, messages: list[dict[str, str]], sampling: SamplingParams
+    ) -> Iterator[str]:
         """Consume the server's OpenAI-compatible SSE stream."""
         import urllib.request
 
         payload: dict[str, Any] = {
             "messages": messages,
-            "max_tokens": max_tokens,
             "stream": True,
+            **sampling.to_dict(),
         }
         if self.alias:
             payload["model"] = self.alias
@@ -578,9 +590,11 @@ class _Chat:
         max_tokens: int = 256,
         show_route: bool = False,
         memory: bool = True,
+        sampling: SamplingParams | None = None,
     ) -> None:
         self.backend = backend
-        self.max_tokens = max_tokens
+        self.sampling = sampling or SamplingParams(max_tokens=max_tokens)
+        self.max_tokens = self.sampling.max_tokens
         self.show_route = show_route
         self.memory = memory
         self.messages: list[dict[str, str]] = []
@@ -608,7 +622,7 @@ class _Chat:
 
         chunks: list[str] = []
         try:
-            for token in self.backend.stream(payload, self.max_tokens):
+            for token in self.backend.stream(payload, self.sampling):
                 chunks.append(token)
                 sys.stdout.write(token)
                 sys.stdout.flush()
@@ -634,9 +648,133 @@ _HELP = """\
 /model             models in the assembly and which are loaded
 /route <text>      show which model would answer, without generating
 /persona           show the active persona
+/params            sampling settings, shown as meters
+/temp <n>          randomness            (0.0-2.0, default 0.8)
+/top_p <n>         nucleus sampling       (0.0-1.0, default 0.95)
+/top_k <n>         top-k cutoff           (1-100, default 40)
+/repeat <n>        repeat penalty        (1.0-2.0, default 1.1)
+/presence <n>      presence penalty      (-2.0 to 2.0, default 0)
+/frequency <n>     frequency penalty     (-2.0 to 2.0, default 0)
+/max <n>           max tokens per reply   (16-8192, default 512)
+/stop <text>       stop sequence         (/stop clear to remove)
+/preset <name>     precise | balanced | creative
 /clear             forget the conversation
 /bye               exit\
 """
+
+
+# Short forms that jump straight into /params, e.g. `/temp 1.2`.
+_PARAM_ALIASES = frozenset({
+    "temp", "temperature", "top_p", "topp", "p", "top_k", "topk", "k",
+    "repeat", "rep", "presence", "frequency", "max", "tokens", "len",
+    "stop", "preset",
+})
+
+# Numeric knobs, addressable by short or literal name.
+_SAMPLING_ALIASES = {
+    "temp": "temperature", "temperature": "temperature",
+    "top_p": "top_p", "topp": "top_p", "p": "top_p",
+    "top_k": "top_k", "topk": "top_k", "k": "top_k",
+    "repeat": "repeat_penalty", "rep": "repeat_penalty",
+    "repeat_penalty": "repeat_penalty",
+    "presence": "presence_penalty", "presence_penalty": "presence_penalty",
+    "frequency": "frequency_penalty", "frequency_penalty": "frequency_penalty",
+    "max": "max_tokens", "max_tokens": "max_tokens",
+    "tokens": "max_tokens", "len": "max_tokens",
+}
+
+
+def _print_sampling(params: SamplingParams) -> None:
+    """Render the sampler settings as meters.
+
+    Values that differ from the balanced preset are flagged inline, so it is
+    obvious which knob a session has wandered away from.
+    """
+    defaults = SAMPLING_PRESETS["balanced"]
+    for field, (label, low, high) in SAMPLING_FIELDS.items():
+        value = getattr(params, field)
+        marker = defaults[field]
+        suffix = "" if value == marker else f"    balanced uses {marker}"
+        ui.meter(label, float(value), low, high, suffix=suffix)
+
+    ui.dim(
+        f"  {'stop':<16}"
+        + (", ".join(repr(s) for s in params.stop) if params.stop else "(none)")
+    )
+
+
+def _cmd_params(chat: "_Chat", rest: str) -> None:
+    """``/params`` plus its per-knob subcommands."""
+    if not rest:
+        ui.blank()
+        _print_sampling(chat.sampling)
+        return
+
+    parts = rest.split(None, 1)
+    key = parts[0].lower()
+    value = parts[1].strip() if len(parts) > 1 else ""
+
+    if key == "preset":
+        if not value:
+            ui.dim("usage: /preset precise|balanced|creative")
+            return
+        try:
+            chosen = sampling_params_from_preset(value)
+        except KeyError:
+            ui.error(f"unknown preset: {value}")
+            ui.dim("available: " + ", ".join(SAMPLING_PRESETS))
+            return
+        chat.sampling = chosen
+        chat.max_tokens = chosen.max_tokens
+        ui.blank()
+        ui.success(f"preset {value.lower()}")
+        _print_sampling(chosen)
+        return
+
+    if key == "stop":
+        if not value or value.lower() in ("clear", "none", "off"):
+            chat.sampling.stop = []
+            ui.dim("stop sequences cleared")
+            return
+        chat.sampling.stop = [value]
+        ui.dim(f"stopping on {value!r}")
+        return
+
+    # Numeric knobs, addressable by short or literal name.
+    field = _SAMPLING_ALIASES.get(key)
+    if field is None:
+        ui.error(f"unknown setting: {key}")
+        ui.dim("try: /temp 1.2   /top_p 0.9   /preset creative")
+        return
+    if not value:
+        ui.dim(f"usage: /{key} <value>   current: {getattr(chat.sampling, field)}")
+        return
+
+    label, low, high = SAMPLING_FIELDS[field]
+    try:
+        number = float(value.replace(",", "."))
+    except ValueError:
+        ui.error(f"{label} needs a number, got {value!r}")
+        return
+    if number != number:  # NaN
+        ui.error(f"{label} needs a number, got {value!r}")
+        return
+
+    clamped = max(low, min(high, number))
+    if field in ("top_k", "max_tokens"):
+        clamped = int(clamped)
+    setattr(chat.sampling, field, clamped)
+
+    if clamped != number:
+        ui.warn(f"{label} clamped to {clamped} (allowed {low:g} to {high:g})")
+    else:
+        ui.dim(f"{label} = {clamped}")
+
+    if field == "max_tokens":
+        chat.max_tokens = clamped
+
+    ui.blank()
+    _print_sampling(chat.sampling)
 
 
 def _repl(backend: _Backend, max_tokens: int, show_route: bool, memory: bool) -> None:
@@ -765,6 +903,11 @@ def _handle_command(chat: _Chat, line: str) -> bool:
     if name == "persona":
         print()
         ui.dim(chat.backend.info().get("persona") or "(none)")
+        return False
+
+    if name == "params" or name in _PARAM_ALIASES:
+        rest_for_params = rest if name == "params" else f"{name} {rest}".strip()
+        _cmd_params(chat, rest_for_params)
         return False
 
     ui.error(f"unknown command: /{name}")

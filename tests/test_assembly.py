@@ -19,6 +19,8 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from assembly import ui  # noqa: E402
+
 # ── Header tests ─────────────────────────────────────────────────────
 
 from assembly.header import (
@@ -1295,6 +1297,555 @@ class TestTerminalUI:
 
         monkeypatch.setattr(ui, "_NO_COLOR", True)
         assert ui.prompt_text() == "▸ "
+
+
+class TestMeter:
+    """The sampling bars, including the signed penalties."""
+
+    def _cells(self, err: str) -> str:
+        """Just the bar glyphs, without the label or the number."""
+        return "".join(c for c in err if c in "\u2588\u00b7\u2502")
+
+    def test_minimum_shows_a_single_cell(self, capsys):
+        """One filled cell keeps the row visible even at the range floor."""
+        ui.meter("temperature", 0.0, 0.0, 2.0)
+        assert self._cells(capsys.readouterr().err).count("\u2588") == 1
+
+    def test_halfway_is_half_full(self, capsys):
+        ui.meter("temperature", 1.0, 0.0, 2.0)
+        cells = self._cells(capsys.readouterr().err)
+        assert cells.count("\u2588") == 12
+
+    def test_full_range_is_all_blocks(self, capsys):
+        ui.meter("temperature", 2.0, 0.0, 2.0)
+        assert capsys.readouterr().err.count("\u2588") == 24
+
+    def test_signed_zero_sits_in_the_middle(self, capsys):
+        """A neutral penalty must not look half-applied."""
+        out = capsys.readouterr().err
+        ui.meter("presence", 0.0, -2.0, 2.0)
+        out = capsys.readouterr().err
+        assert "\u2502" in out
+
+    def test_negative_value_fills_left_of_zero(self, capsys):
+        ui.meter("presence", -1.0, -2.0, 2.0)
+        cells = self._cells(capsys.readouterr().err)
+        # The bar grows from the centre towards the left edge.
+        assert cells.index("\u2588") < cells.index("\u2502")
+
+    def test_positive_value_fills_right_of_zero(self, capsys):
+        ui.meter("presence", 1.0, -2.0, 2.0)
+        cells = self._cells(capsys.readouterr().err)
+        filled = [i for i, c in enumerate(cells) if c == "\u2588"]
+        assert filled and min(filled) >= 12  # the zero tick is at the centre
+
+    def test_opposite_signs_mirror(self, capsys):
+        ui.meter("presence", -1.0, -2.0, 2.0)
+        neg = self._cells(capsys.readouterr().err)
+        ui.meter("presence", 1.0, -2.0, 2.0)
+        pos = self._cells(capsys.readouterr().err)
+        neg_fill = {i for i, c in enumerate(neg) if c == "\u2588"}
+        pos_fill = {i for i, c in enumerate(pos) if c == "\u2588"}
+        # Equal magnitude, opposite sign: the fill mirrors about the centre.
+        assert {len(neg) - 1 - i for i in neg_fill} == pos_fill
+
+    def test_out_of_range_does_not_overflow(self, capsys):
+        ui.meter("temperature", 999.0, 0.0, 2.0)
+        assert capsys.readouterr().err.count("\u2588") == 24
+
+    def test_stderr_only(self, capsys):
+        ui.meter("temperature", 1.0, 0.0, 2.0)
+        assert capsys.readouterr().out == ""
+
+
+# ── Sampling ──────────────────────────────────────────────────────────
+class TestSamplingParams:
+    def test_defaults_are_llama_cpp_defaults(self):
+        from assembly.config import SamplingParams
+
+        p = SamplingParams()
+        assert p.temperature == 0.8
+        assert p.top_p == 0.95
+        assert p.top_k == 40
+        assert p.repeat_penalty == 1.1
+        assert p.stop == []
+
+    def test_body_values_are_honoured(self):
+        from assembly.config import sampling_params_from_body as f
+
+        p = f({"temperature": 1.6, "top_p": 0.5, "top_k": 20,
+               "max_tokens": 100, "stop": ["END"]})
+        assert p.temperature == 1.6
+        assert p.top_p == 0.5
+        assert p.top_k == 20
+        assert p.max_tokens == 100
+        assert p.stop == ["END"]
+
+    @pytest.mark.parametrize("body,field,expected", [
+        ({"temperature": 99}, "temperature", 2.0),
+        ({"temperature": -5}, "temperature", 0.0),
+        ({"top_p": 5}, "top_p", 1.0),
+        ({"top_p": -1}, "top_p", 0.0),
+        ({"top_k": 0}, "top_k", 1),
+        ({"top_k": 100000}, "top_k", 100),
+        ({"max_tokens": 1}, "max_tokens", 16),
+        ({"max_tokens": 10**9}, "max_tokens", 8192),
+    ])
+    def test_out_of_range_is_clamped_not_rejected(self, body, field, expected):
+        """A client asking for something impossible gets a working request."""
+        from assembly.config import sampling_params_from_body as f
+
+        assert getattr(f(body), field) == expected
+
+    @pytest.mark.parametrize("bad", ["hot", None, True, [], {}])
+    def test_unusable_value_leaves_the_default_alone(self, bad):
+        """Notably, garbage must not become 0.0, which would silently make
+        generation fully deterministic."""
+        from assembly.config import SamplingParams, sampling_params_from_body as f
+
+        assert f({"temperature": bad}).temperature == SamplingParams().temperature
+
+    def test_nan_is_ignored(self):
+        import math
+
+        from assembly.config import sampling_params_from_body as f
+
+        assert f({"temperature": math.nan}).temperature == 0.8
+
+    def test_the_three_penalties_stay_independent(self):
+        """llama.cpp implements all three, so one must not overwrite another."""
+        from assembly.config import sampling_params_from_body as f
+
+        p = f({"presence_penalty": 0.5, "frequency_penalty": 1.3, "repeat_penalty": 1.2})
+        assert p.presence_penalty == 0.5
+        assert p.frequency_penalty == 1.3
+        assert p.repeat_penalty == 1.2
+
+    def test_penalties_default_to_neutral(self):
+        from assembly.config import SamplingParams
+
+        p = SamplingParams()
+        assert p.presence_penalty == 0.0
+        assert p.frequency_penalty == 0.0
+
+    def test_openai_penalties_accept_negative_values(self):
+        """Negative penalties are meaningful in OpenAI; they must not be lost."""
+        from assembly.config import sampling_params_from_body as f
+
+        p = f({"presence_penalty": -0.5, "frequency_penalty": -1.0})
+        assert p.presence_penalty == -0.5
+        assert p.frequency_penalty == -1.0
+
+    @pytest.mark.parametrize("key", ["presence_penalty", "frequency_penalty"])
+    def test_openai_penalties_are_clamped(self, key):
+        from assembly.config import sampling_params_from_body as f
+
+        assert getattr(f({key: 99}), key) == 2.0
+        assert getattr(f({key: -99}), key) == -2.0
+
+    def test_repeat_penalty_stays_above_one(self):
+        """It is a multiplier, so a request for 0.5 is clamped up to neutral."""
+        from assembly.config import sampling_params_from_body as f
+
+        assert f({"repeat_penalty": 0.1}).repeat_penalty == 1.0
+
+    def test_max_completion_tokens_alias(self):
+        from assembly.config import sampling_params_from_body as f
+
+        assert f({"max_completion_tokens": 333}).max_tokens == 333
+
+    def test_stop_accepts_string_or_list(self):
+        from assembly.config import sampling_params_from_body as f
+
+        assert f({"stop": "END"}).stop == ["END"]
+        assert f({"stop": ["A", "B"]}).stop == ["A", "B"]
+
+    def test_base_is_preserved_for_unset_keys(self):
+        from assembly.config import SamplingParams, sampling_params_from_body as f
+
+        base = SamplingParams(temperature=0.1, top_k=7)
+        out = f({"top_p": 0.5}, base=base)
+        assert out.temperature == 0.1
+        assert out.top_k == 7
+        assert out.top_p == 0.5
+
+    def test_llama_kwargs_shape(self):
+        from assembly.config import SamplingParams
+
+        kwargs = SamplingParams(stop=["X"], seed=7).to_llama_kwargs()
+        assert kwargs["temperature"] == 0.8
+        assert kwargs["top_k"] == 40
+        assert kwargs["repeat_penalty"] == 1.1
+        assert kwargs["stop"] == ["X"]
+        assert kwargs["seed"] == 7
+
+    def test_absent_seed_is_not_sent(self):
+        from assembly.config import SamplingParams
+
+        assert "seed" not in SamplingParams().to_llama_kwargs()
+
+    def test_empty_stop_is_not_sent(self):
+        from assembly.config import SamplingParams
+
+        assert "stop" not in SamplingParams().to_llama_kwargs()
+
+    @pytest.mark.parametrize("name", ["precise", "balanced", "creative"])
+    def test_presets_are_sane(self, name):
+        from assembly.config import SAMPLING_FIELDS, sampling_params_from_preset
+
+        p = sampling_params_from_preset(name)
+        for field, (_label, low, high) in SAMPLING_FIELDS.items():
+            value = getattr(p, field)
+            assert low <= value <= high, f"{name}.{field} out of range"
+
+    def test_precise_is_cooler_than_creative(self):
+        from assembly.config import sampling_params_from_preset
+
+        assert (sampling_params_from_preset("precise").temperature
+                < sampling_params_from_preset("creative").temperature)
+
+    def test_unknown_preset_raises(self):
+        from assembly.config import sampling_params_from_preset
+
+        with pytest.raises(KeyError):
+            sampling_params_from_preset("nope")
+
+    @pytest.mark.parametrize("name", ["precise", "balanced", "creative"])
+    def test_every_preset_defines_every_field(self, name):
+        """The UI compares against these, so a gap would print "None"."""
+        from assembly.config import SAMPLING_FIELDS, SAMPLING_PRESETS
+
+        assert set(SAMPLING_PRESETS[name]) >= set(SAMPLING_FIELDS)
+
+    def test_presets_reset_every_knob(self):
+        """Switching preset must not leave a stale penalty behind."""
+        from assembly.config import sampling_params_from_preset
+
+        chat_like = sampling_params_from_preset("balanced")
+        chat_like.presence_penalty = 1.5
+        assert sampling_params_from_preset("precise").presence_penalty == 0.0
+
+
+
+class TestSamplingCommands:
+    """The /params family in the interactive session."""
+
+    def _chat(self):
+        from assembly import main as main_mod
+        from assembly.config import SamplingParams
+
+        class FakeBackend:
+            def info(self):
+                return {"assembly": "Mesh-1.0"}
+
+        return main_mod._Chat(FakeBackend(), sampling=SamplingParams())
+
+    def _run(self, chat, cmd):
+        from assembly import main as main_mod
+
+        return main_mod._handle_command(chat, cmd)
+
+    def test_params_shows_every_knob(self, capsys):
+        chat = self._chat()
+        self._run(chat, "/params")
+        err = capsys.readouterr().err
+        for label in ("temperature", "top_p", "top_k", "repeat penalty", "max tokens"):
+            assert label in err
+
+    def test_temp_sets_value(self):
+        chat = self._chat()
+        self._run(chat, "/temp 1.6")
+        assert chat.sampling.temperature == 1.6
+
+    def test_comma_decimal_is_accepted(self):
+        chat = self._chat()
+        self._run(chat, "/temp 1,6")
+        assert chat.sampling.temperature == 1.6
+
+    @pytest.mark.parametrize("cmd,field,value", [
+        ("/temp 0.3", "temperature", 0.3),
+        ("/top_p 0.5", "top_p", 0.5),
+        ("/top_k 20", "top_k", 20),
+        ("/repeat 1.2", "repeat_penalty", 1.2),
+        ("/presence 0.7", "presence_penalty", 0.7),
+        ("/frequency -0.4", "frequency_penalty", -0.4),
+        ("/max 100", "max_tokens", 100),
+    ])
+    def test_each_knob(self, cmd, field, value):
+        chat = self._chat()
+        self._run(chat, cmd)
+        assert getattr(chat.sampling, field) == value
+
+    @pytest.mark.parametrize("cmd,field,expected", [
+        ("/temp 99", "temperature", 2.0),
+        ("/temp -3", "temperature", 0.0),
+        ("/top_k 5000", "top_k", 100),
+    ])
+    def test_command_clamps(self, cmd, field, expected):
+        chat = self._chat()
+        self._run(chat, cmd)
+        assert getattr(chat.sampling, field) == expected
+
+    def test_garbage_value_leaves_default(self, capsys):
+        chat = self._chat()
+        before = chat.sampling.temperature
+        self._run(chat, "/temp banana")
+        assert chat.sampling.temperature == before
+        assert "needs a number" in capsys.readouterr().err
+
+    def test_nan_value_leaves_default(self, capsys):
+        chat = self._chat()
+        before = chat.sampling.temperature
+        self._run(chat, "/temp nan")
+        assert chat.sampling.temperature == before
+
+    def test_max_updates_the_chat_budget(self):
+        chat = self._chat()
+        self._run(chat, "/max 123")
+        assert chat.sampling.max_tokens == 123
+        assert chat.max_tokens == 123
+
+    def test_preset_applies_all_knobs(self):
+        from assembly.config import sampling_params_from_preset
+
+        chat = self._chat()
+        self._run(chat, "/preset precise")
+        expected = sampling_params_from_preset("precise")
+        assert chat.sampling.temperature == expected.temperature
+        assert chat.sampling.top_k == expected.top_k
+
+    def test_preset_case_insensitive(self):
+        chat = self._chat()
+        self._run(chat, "/preset CREATIVE")
+        assert chat.sampling.temperature == 1.2
+
+    def test_unknown_preset_is_rejected(self, capsys):
+        chat = self._chat()
+        before = chat.sampling.temperature
+        self._run(chat, "/preset nonsense")
+        assert chat.sampling.temperature == before
+        assert "unknown preset" in capsys.readouterr().err
+
+    def test_stop_sets_and_clears(self):
+        chat = self._chat()
+        self._run(chat, "/stop END")
+        assert chat.sampling.stop == ["END"]
+        self._run(chat, "/stop clear")
+        assert chat.sampling.stop == []
+
+    def test_stop_is_forwarded_to_llama(self):
+        chat = self._chat()
+        self._run(chat, "/stop DONE")
+        assert chat.sampling.to_llama_kwargs()["stop"] == ["DONE"]
+
+    def test_penalty_command_forwards_to_llama(self):
+        chat = self._chat()
+        self._run(chat, "/presence 0.7")
+        self._run(chat, "/frequency -0.4")
+        kwargs = chat.sampling.to_llama_kwargs()
+        assert kwargs["presence_penalty"] == 0.7
+        assert kwargs["frequency_penalty"] == -0.4
+
+    def test_penalty_command_clamps(self):
+        chat = self._chat()
+        self._run(chat, "/presence 99")
+        assert chat.sampling.presence_penalty == 2.0
+        self._run(chat, "/frequency -99")
+        assert chat.sampling.frequency_penalty == -2.0
+
+    def test_unknown_setting_is_reported(self, capsys):
+        chat = self._chat()
+        self._run(chat, "/params bogus 5")
+        assert "unknown setting" in capsys.readouterr().err
+
+    def test_unrelated_command_still_errors_normally(self, capsys):
+        chat = self._chat()
+        self._run(chat, "/bogus 5")
+        assert "unknown command" in capsys.readouterr().err
+
+    def test_short_aliases_route_to_params(self):
+        """`/temp 1.2` must work as a top-level command, not just `/params temp`."""
+        chat = self._chat()
+        self._run(chat, "/temp 1.2")
+        assert chat.sampling.temperature == 1.2
+
+    def test_params_does_not_pollute_stdout(self, capsys):
+        chat = self._chat()
+        self._run(chat, "/params")
+        assert capsys.readouterr().out == ""
+
+    def test_help_lists_the_new_commands(self, capsys):
+        chat = self._chat()
+        self._run(chat, "/help")
+        out = capsys.readouterr().out
+        for token in ("/params", "/temp", "/top_p", "/top_k", "/repeat", "/stop", "/preset"):
+            assert token in out
+
+
+class TestServerSampling:
+    """Sampling must travel from the HTTP body into llama.cpp untouched."""
+
+    def _run(self, body: dict, stream: bool = False):
+        from assembly.server import ModelManager
+        from assembly.wrapper import RouteResult
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        mock_llm = MagicMock()
+        mock_llm.header.assembly_name = "TestAssembly"
+        mock_llm.header.models = []
+        mock_llm.route.return_value = RouteResult(
+            model_name="coder", model_index=0, score=0.92, is_fallback=False
+        )
+        if stream:
+            mock_llm.create_chat_completion.return_value = iter([
+                {"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ])
+        else:
+            mock_llm.create_chat_completion.return_value = {
+                "id": "chat-123",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            }
+        mock_llm.return_value = {
+            "id": "cmpl-123", "choices": [{"text": "ok"}],
+        }
+        mgr._models["assembly"] = mock_llm
+        mgr._active_alias = "assembly"
+
+        payload = json.dumps(body).encode()
+        sock = MockSocket(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        from assembly.server import AssemblyRequestHandler
+
+        mock_server = MagicMock()
+        mock_server.manager = mgr
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        raw = sock.get_output()
+        header, _, rest = raw.partition(b"\r\n\r\n")
+        return mock_llm, header.decode("utf-8"), rest
+
+    def _kwargs(self, body, stream=False):
+        mock_llm, _, _ = self._run(body, stream)
+        return mock_llm.create_chat_completion.call_args.kwargs
+
+    def test_defaults_reach_llama(self):
+        kw = self._kwargs({"messages": [{"role": "user", "content": "hi"}]})
+        assert kw["temperature"] == 0.8
+        assert kw["top_p"] == 0.95
+        assert kw["top_k"] == 40
+        assert kw["max_tokens"] == 512
+
+    def test_client_values_reach_llama(self):
+        kw = self._kwargs({
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 1.6, "top_p": 0.5, "top_k": 20,
+            "frequency_penalty": 1.3, "max_tokens": 77, "stop": ["END"],
+        })
+        assert kw["temperature"] == 1.6
+        assert kw["top_p"] == 0.5
+        assert kw["top_k"] == 20
+        assert kw["frequency_penalty"] == 1.3
+        assert kw["max_tokens"] == 77
+        assert kw["stop"] == ["END"]
+
+    def test_hostile_values_do_not_break_the_request(self):
+        kw = self._kwargs({
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": "nonsense", "top_k": 99999, "max_tokens": -5,
+        })
+        assert kw["temperature"] == 0.8
+        assert kw["top_k"] == 100
+        assert kw["max_tokens"] == 16
+
+    def test_streaming_forwards_sampling(self):
+        """Regression: streaming used to be handed only max_tokens/temperature."""
+        kw = self._kwargs({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True, "temperature": 1.6, "top_k": 20, "stop": ["END"],
+        }, stream=True)
+        assert kw["stream"] is True
+        assert kw["temperature"] == 1.6
+        assert kw["top_k"] == 20
+        assert kw["stop"] == ["END"]
+
+    def test_streaming_emits_sse(self):
+        _mock, header, body = self._run(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True},
+            stream=True,
+        )
+        assert "200" in header.splitlines()[0]
+        assert "event-stream" in header.lower()
+        assert b"[DONE]" in body
+
+    def test_unknown_params_are_ignored_not_fatal(self):
+        _mock, header, _ = self._run({
+            "messages": [{"role": "user", "content": "hi"}],
+            "some_future_openai_field": 1,
+        })
+        assert "200" in header.splitlines()[0]
+
+
+
+class TestServerCompletionsSampling:
+    """`/v1/completions` and `/api/generate` must forward sampling too."""
+
+    def _kwargs(self, path: str, body: dict):
+        from assembly.server import ModelManager, AssemblyRequestHandler
+        from assembly.wrapper import RouteResult
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        mock_llm = MagicMock()
+        mock_llm.header.assembly_name = "TestAssembly"
+        mock_llm.header.models = []
+        mock_llm.route.return_value = RouteResult(
+            model_name="coder", model_index=0, score=0.92, is_fallback=False
+        )
+        mock_llm.return_value = {"id": "cmpl-1", "choices": [{"text": "ok"}]}
+        mgr._models["assembly"] = mock_llm
+        mgr._active_alias = "assembly"
+
+        payload = json.dumps(body).encode()
+        sock = MockSocket(
+            f"POST {path} HTTP/1.1\r\nHost: localhost\r\n".encode()
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        mock_server = MagicMock()
+        mock_server.manager = mgr
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        return mock_llm.call_args.kwargs
+
+    @pytest.mark.parametrize("path", ["/v1/completions", "/api/generate"])
+    def test_sampling_reaches_llama(self, path):
+        kw = self._kwargs(path, {
+            "prompt": "hi", "temperature": 1.6, "top_p": 0.5, "top_k": 20,
+            "presence_penalty": 0.5, "frequency_penalty": 0.5,
+            "repeat_penalty": 1.2, "max_tokens": 77, "stop": ["END"], "seed": 3,
+        })
+        assert kw["temperature"] == 1.6
+        assert kw["top_p"] == 0.5
+        assert kw["top_k"] == 20
+        assert kw["presence_penalty"] == 0.5
+        assert kw["frequency_penalty"] == 0.5
+        assert kw["repeat_penalty"] == 1.2
+        assert kw["max_tokens"] == 77
+        assert kw["stop"] == ["END"]
+        assert kw["seed"] == 3
+
+    @pytest.mark.parametrize("path", ["/v1/completions", "/api/generate"])
+    def test_defaults(self, path):
+        kw = self._kwargs(path, {"prompt": "hi"})
+        assert kw["temperature"] == 0.8
+        assert kw["max_tokens"] == 256  # the legacy default, not the chat one
 
 
 # ── Staging directory ─────────────────────────────────────────────────
