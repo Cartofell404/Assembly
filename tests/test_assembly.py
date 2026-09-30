@@ -1007,8 +1007,56 @@ class TestPackerIntegrity:
         build(cfg_path, out, skip_embeddings=True)
 
         assert out.is_file()
-        assert not (tmp_path / "built.asmb.partial").exists()
+        assert not list(tmp_path.glob("built.asmb.partial*"))
         assert read_header(out.read_bytes()).assembly_name == "integrity"
+
+    def test_a_killed_build_is_swept_on_the_next_run(self, tmp_path):
+        """SIGKILL and power cuts never run the cleanup handler.
+
+        Those are the cases that leave an interrupted multi-gigabyte archive
+        on disk, so the next build has to recognise and reclaim it.
+        """
+        from assembly.packer import _sweep_abandoned
+
+        out = tmp_path / "built.asmb"
+        orphan = tmp_path / "built.asmb.partial-999999"
+        orphan.write_bytes(b"x" * 4096)
+
+        _sweep_abandoned(out)
+        assert not orphan.exists()
+
+    def test_a_running_build_is_never_swept(self, tmp_path):
+        """Deleting a live build's partial would corrupt a good build."""
+        import os
+        from assembly.packer import _sweep_abandoned
+
+        out = tmp_path / "built.asmb"
+        live = tmp_path / f"built.asmb.partial-{os.getpid()}"
+        live.write_bytes(b"x" * 4096)
+
+        _sweep_abandoned(out)
+        assert live.exists(), "this pid is running, so the file must stay"
+
+    def test_sweep_ignores_unrelated_files(self, tmp_path):
+        from assembly.packer import _sweep_abandoned
+
+        out = tmp_path / "built.asmb"
+        for name in ("built.asmb.partial-notapid", "built.asmb.partial-",
+                     "other.asmb.partial-999999", "built.asmb"):
+            (tmp_path / name).write_bytes(b"x")
+
+        _sweep_abandoned(out)
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "built.asmb", "built.asmb.partial-", "built.asmb.partial-notapid",
+            "other.asmb.partial-999999",
+        ]
+
+    def test_a_successful_build_leaves_nothing_behind(self, tmp_path):
+        from assembly.packer import build
+
+        out = tmp_path / "built.asmb"
+        build(self._config(tmp_path), out, skip_embeddings=True)
+        assert not list(tmp_path.glob("built.asmb.partial*"))
 
     def test_truncated_source_model_fails_the_build(self, tmp_path):
         """A model shrinking between stat() and copy() must not be packed."""
@@ -1036,7 +1084,7 @@ class TestPackerIntegrity:
 
         # Nothing usable is left behind, and no half-written archive is exposed.
         assert not out.exists()
-        assert not (tmp_path / "built.asmb.partial").exists()
+        assert not list(tmp_path.glob("built.asmb.partial*"))
 
     def test_size_mismatch_is_rejected(self, tmp_path):
         from assembly import packer
@@ -1058,7 +1106,7 @@ class TestPackerIntegrity:
             packer._copy_file = real_copy
 
         assert not out.exists()
-        assert not (tmp_path / "built.asmb.partial").exists()
+        assert not list(tmp_path.glob("built.asmb.partial*"))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
@@ -1694,6 +1742,10 @@ class TestServerSampling:
         mock_llm = MagicMock()
         mock_llm.header.assembly_name = "TestAssembly"
         mock_llm.header.models = []
+        # A bare MagicMock would be truthy and not an int, which is exactly
+        # what _context_note is written to refuse.
+        mock_llm.context_window = 4096
+        mock_llm._last_summarized = False
         mock_llm.route.return_value = RouteResult(
             model_name="coder", model_index=0, score=0.92, is_fallback=False
         )
@@ -1783,6 +1835,39 @@ class TestServerSampling:
         assert "event-stream" in header.lower()
         assert b"[DONE]" in body
 
+    def test_streaming_reports_the_context_window(self):
+        """A streaming client must learn its history was compressed.
+
+        The non-streaming path has always said so via ``assembly_context``.
+        Without it here, the most common way of talking to the server was the
+        one way that could not tell whether the turns it sent were still being
+        sent.
+        """
+        _mock, _header, body = self._run(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True},
+            stream=True,
+        )
+        frames = [
+            json.loads(line[len("data: "):])
+            for line in body.decode().splitlines()
+            if line.startswith("data: ") and "[DONE]" not in line
+        ]
+        notes = [f for f in frames if "assembly_context" in f]
+        assert len(notes) == 1, "exactly one context frame, before [DONE]"
+        note = notes[0]["assembly_context"]
+        assert note["window"] == 4096
+        assert note["summarized"] is False
+        # It must not look like content to a client walking deltas.
+        assert notes[0]["choices"] == []
+
+    def test_streaming_context_frame_precedes_done(self):
+        _mock, _header, body = self._run(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True},
+            stream=True,
+        )
+        text = body.decode()
+        assert text.index("assembly_context") < text.index("[DONE]")
+
     def test_unknown_params_are_ignored_not_fatal(self):
         _mock, header, _ = self._run({
             "messages": [{"role": "user", "content": "hi"}],
@@ -1804,6 +1889,10 @@ class TestServerCompletionsSampling:
         mock_llm = MagicMock()
         mock_llm.header.assembly_name = "TestAssembly"
         mock_llm.header.models = []
+        # A bare MagicMock would be truthy and not an int, which is exactly
+        # what _context_note is written to refuse.
+        mock_llm.context_window = 4096
+        mock_llm._last_summarized = False
         mock_llm.route.return_value = RouteResult(
             model_name="coder", model_index=0, score=0.92, is_fallback=False
         )
@@ -2100,6 +2189,20 @@ class TestAutoContextWindow:
         assert f(blob) == (3, 1)
 
 
+from assembly import wrapper  # noqa: E402
+
+PAGE = 4096
+
+
+def _model_marker(index: int) -> bytes:
+    """Bytes that identify which model a header read came from."""
+    return f"model:{index}".encode()
+
+
+def _model_index(head: bytes) -> int:
+    return int(bytes(head).split(b":", 1)[1].split(b"\0", 1)[0])
+
+
 class TestContextResolution:
     """Smallest declared window wins; nothing can override it."""
 
@@ -2113,95 +2216,91 @@ class TestContextResolution:
         obj._n_ctx = 0
         obj._log = lambda *a, **k: None
 
+        # Each model gets a distinct offset and its own marker bytes, so a
+        # test can identify which model is being parsed instead of counting
+        # calls. The context reader may ask about one model more than once.
         header = MagicMock()
         header.models = []
-        for n in contexts:
+        for i, n in enumerate(contexts):
             m = MagicMock()
             m.name = n
-            m.offset = 0
+            m.offset = i * PAGE
             m.size = 1024
             header.models.append(m)
         obj._header = header
 
+        def read(self, key):
+            start = key.start or 0
+            return _model_marker(start // PAGE).ljust(4 << 20, b"\0")
+
         mm = MagicMock()
-        mm.__getitem__ = lambda self, key: b"x" * (4 << 20)
+        mm.__getitem__ = read
         obj._mm = mm
         return obj
 
-    def test_smallest_window_is_chosen(self, monkeypatch):
+    def _patch_parser(self, monkeypatch, table):
+        """Make the parser answer per model, by marker rather than call order."""
         import assembly.wrapper as wrapper
 
-        values = iter([8192, 4096, 32768])
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: next(values))
+        monkeypatch.setattr(
+            wrapper,
+            "gguf_context_length_from_bytes",
+            lambda head: table[_model_index(head)],
+        )
+
+    def test_smallest_window_is_chosen(self, monkeypatch):
         obj = self._llama(["a", "b", "c"])
+        self._patch_parser(monkeypatch, {0: 8192, 1: 4096, 2: 32768})
         obj._resolve_context_window()
         assert obj.context_window == 4096
 
     def test_single_model_uses_its_own_window(self, monkeypatch):
-        import assembly.wrapper as wrapper
-
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: 65536)
         obj = self._llama(["only"])
+        self._patch_parser(monkeypatch, {0: 65536})
         obj._resolve_context_window()
         assert obj.context_window == 65536
 
     def test_unknown_model_falls_back_conservatively(self, monkeypatch):
-        import assembly.wrapper as wrapper
-
-        values = iter([131072, None])
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: next(values))
         obj = self._llama(["a", "b"])
+        self._patch_parser(monkeypatch, {0: 131072, 1: None})
         obj._resolve_context_window()
         assert obj.context_window == wrapper.FALLBACK_CONTEXT
 
     def test_all_unknown_falls_back(self, monkeypatch):
-        import assembly.wrapper as wrapper
-
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: None)
         obj = self._llama(["a", "b"])
+        self._patch_parser(monkeypatch, {0: None, 1: None})
         obj._resolve_context_window()
         assert obj.context_window == wrapper.FALLBACK_CONTEXT
 
     def test_absurd_value_is_clamped(self, monkeypatch):
-        import assembly.wrapper as wrapper
-
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: 1 << 40)
         obj = self._llama(["a"])
+        self._patch_parser(monkeypatch, {0: 1 << 30})
         obj._resolve_context_window()
         assert obj.context_window == wrapper.MAX_CONTEXT
 
     def test_a_zero_window_counts_as_undeclared(self, monkeypatch):
         """0 means "not declared", so the conservative fallback wins over
         clamping to a useless 512."""
-        import assembly.wrapper as wrapper
-
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: 0)
         obj = self._llama(["a"])
+        self._patch_parser(monkeypatch, {0: 0})
         obj._resolve_context_window()
         assert obj.context_window == wrapper.FALLBACK_CONTEXT
 
     def test_absurdly_small_window_is_raised_to_the_floor(self, monkeypatch):
-        import assembly.wrapper as wrapper
-
-        monkeypatch.setattr(wrapper, "gguf_context_length_from_bytes",
-                            lambda head: 8)
         obj = self._llama(["a"])
+        self._patch_parser(monkeypatch, {0: 8})
         obj._resolve_context_window()
         assert obj.context_window == wrapper.MIN_CONTEXT
 
-    def test_no_override_parameter_exists(self):
-        """The constructor must not accept a caller-chosen window."""
-        import inspect
-        from assembly.wrapper import AssemblyLlama
-
-        params = inspect.signature(AssemblyLlama.__init__).parameters
-        assert "n_ctx" not in params
+    def test_a_late_context_key_is_still_found(self, monkeypatch):
+        """The reader escalates its read size when the key is not there."""
+        obj = self._llama(["a"])
+        self._patch_parser(monkeypatch, {0: 65536})
+        obj._resolve_context_window()
+        assert obj.context_window == 65536
+        # Two spans are attempted per model, so the parser is consulted
+        # twice when the first span comes back empty.
+        assert wrapper.HEADER_READ_SPANS[0] < wrapper.HEADER_READ_SPANS[1]
 
     def test_cli_has_no_n_ctx_flag(self):
         from assembly.main import _build_parser

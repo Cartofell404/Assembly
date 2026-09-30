@@ -67,6 +67,15 @@ SUMMARY_OUTPUT_CEILING = 512
 # more per request. The cap bounds the memory a very long session can hold.
 TOKEN_CACHE_ENTRIES = 4096
 
+# Bytes of a model blob read to find its metadata. Matches the split reader
+# so both agree on how much is enough; a model with unusually large tokenizer
+# metadata ahead of the context key would otherwise read as undeclared.
+HEADER_READ_BYTES = 64 << 20
+# Tried in order until the context length is found. 4 MiB covers every GGUF
+# seen in practice; the larger read is only for a model with unusually large
+# tokenizer metadata ahead of the context key.
+HEADER_READ_SPANS = (4 << 20, HEADER_READ_BYTES)
+
 # Tokens reserved for the chat template, the persona and the reply itself.
 TEMPLATE_OVERHEAD = 96
 
@@ -400,8 +409,18 @@ class AssemblyLlama:
 
         contexts: dict[str, Optional[int]] = {}
         for model in self._header.models:
-            head = bytes(self._mm[model.offset : model.offset + (4 << 20)])
-            contexts[model.name] = gguf_context_length_from_bytes(head)
+            # Read little first and escalate only if the key is not there. A
+            # too-short read does not fail loudly -- the model just looks like
+            # it declared no context length, and the window silently collapses
+            # to the fallback. Materialising HEADER_READ_BYTES per model up
+            # front would cost hundreds of megabytes of pointless copies.
+            found: Optional[int] = None
+            for span in HEADER_READ_SPANS:
+                head = bytes(self._mm[model.offset : model.offset + span])
+                found = gguf_context_length_from_bytes(head)
+                if found:
+                    break
+            contexts[model.name] = found
         self._model_contexts = contexts
 
         unknown = [name for name, value in contexts.items() if not value]
@@ -479,7 +498,7 @@ class AssemblyLlama:
         # loaded by llama.cpp at all, and staging costs a multi-gigabyte copy,
         # so there is no reason to discover that after the write.
         split_count, split_no = gguf_split_info_from_bytes(
-            bytes(model_view[: (64 << 20)])
+            bytes(model_view[:HEADER_READ_BYTES])
         )
         if split_count is not None and split_count > 1:
             model_view.release()

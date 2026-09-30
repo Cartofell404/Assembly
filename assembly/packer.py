@@ -46,6 +46,68 @@ class BuildError(RuntimeError):
     """
 
 
+def _fsync_dir(directory: pathlib.Path) -> None:
+    """Persist a rename into *directory*.
+
+    Best effort: some filesystems refuse to open a directory for sync, and
+    that is not a reason to fail a build whose bytes are already written.
+    """
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _writer_alive(pid: int) -> bool:
+    """Whether *pid* still exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _sweep_abandoned(output_path: pathlib.Path) -> None:
+    """Delete partials for *output_path* left by a build that was killed.
+
+    Only ever removes a file whose recorded pid is definitely gone. Pid reuse
+    makes that rare and errs towards keeping a stale file, which wastes disk;
+    deleting a live build's partial would corrupt a good build, which is
+    worse.
+    """
+    prefix = f"{output_path.name}.partial-"
+    try:
+        stale = list(output_path.parent.glob(prefix + "*"))
+    except OSError:
+        return
+    for candidate in stale:
+        suffix = candidate.name[len(prefix):]
+        if not suffix.isdigit():
+            continue
+        if _writer_alive(int(suffix)):
+            continue
+        try:
+            size = candidate.stat().st_size
+            candidate.unlink()
+        except OSError:
+            continue
+        print(
+            f"  ↳ Reclaimed {size / (1024**3):.2f} GiB from an interrupted "
+            f"build ({candidate.name})",
+            file=sys.stderr,
+        )
+
+
 def _file_size(path: pathlib.Path) -> int:
     try:
         return path.stat().st_size
@@ -237,7 +299,18 @@ def build(
     # A half-written .asmb still has a valid 16-byte preamble, so an
     # interrupted build would otherwise look loadable and fail much later
     # inside llama.cpp. Write to a sibling temp file and rename on success.
-    tmp_path = output_path.with_name(output_path.name + ".partial")
+    #
+    # The temp name carries the writer's pid. Ctrl-C, an exception and a
+    # SIGTERM all unwind into the handler below and clean up after
+    # themselves, but SIGKILL and a power cut never run it -- and an
+    # interrupted 8 GB build is exactly the kind of file worth reclaiming
+    # rather than leaving for someone to find by hand. Carrying the pid
+    # makes a leftover identifiable and sweepable, and stops two concurrent
+    # builds to the same output from writing over each other's partial.
+    _sweep_abandoned(output_path)
+    tmp_path = output_path.with_name(
+        f"{output_path.name}.partial-{os.getpid()}"
+    )
     try:
         with open(tmp_path, "wb") as out:
             # Preamble
@@ -287,6 +360,11 @@ def build(
             )
 
         os.replace(tmp_path, output_path)
+        # fsync the file before the rename (done above) makes the contents
+        # durable; fsyncing the directory makes the rename itself durable.
+        # Without this a power cut can leave a correctly written archive
+        # that the directory does not know about.
+        _fsync_dir(output_path.parent)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise

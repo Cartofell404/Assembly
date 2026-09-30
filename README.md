@@ -146,6 +146,32 @@ Validation also catches models that could never load:
   Merge the shards into a single `.gguf` first,
 - a model file that changed or vanished since validation.
 
+#### An interrupted build does not leave a broken archive
+
+Packing several gigabytes takes a while, and a build can be interrupted — by
+Ctrl-C, by a full disk, or by the machine going down. The archive is assembled
+under a temporary name and renamed into place only once every byte is written
+and the header has been read back off disk:
+
+```
+my_models.asmb.partial-48213      ← being written; not a usable archive
+my_models.asmb                    ← appears only when the build succeeds
+```
+
+So there is never a half-written `.asmb` masquerading as a valid one, and
+Ctrl-C leaves nothing behind at all.
+
+A `kill -9` or a power cut cannot run that cleanup, so the abandoned temporary
+file is instead reclaimed by the **next** build, which recognises it and
+removes it:
+
+```
+  ↳ Reclaimed 0.22 GiB from an interrupted build (my_models.asmb.partial-48213)
+```
+
+Only files whose owning process is definitely gone are removed, so a build
+running in another terminal is never disturbed.
+
 ### 3. Start the Server Daemon (`assembly serve`)
 
 Like `ollama serve`, you can start an HTTP server that runs in the background or on a dedicated machine/server:
@@ -234,6 +260,15 @@ learn about it too, so they can stop replaying turns that are no longer sent:
 
 ```json
 {"assembly_context": {"window": 131072, "summarized": true}}
+```
+
+Streaming responses say so too, in a final `assembly_context`-only frame just
+before `[DONE]`. It carries no `choices`, so it cannot be mistaken for content:
+
+```
+data: {"id":"assembly-context","object":"chat.completion.chunk","model":"default:General","assembly_context":{"window":131072,"summarized":true},"choices":[]}
+
+data: [DONE]
 ```
 
 If summarisation fails for any reason the original history is used unchanged,
@@ -488,6 +523,23 @@ python -m pytest tests/ -q
 
 The suite runs in well under a second and loads no real models — the GGUF
 blobs, HTTP server, and CLI are all exercised against fakes.
+
+## How this was written
+
+**This project was built with the assistance of AI coding agents.** The
+architecture, the format, the router and the release decisions were made with
+AI writing much of the code, and AI reviewed and extended it.
+
+Two things follow from that, stated plainly rather than buried:
+
+- **The code has been tested, not verified.** The suite passes and the engine
+  has been exercised against real archives, but correctness rests on tests
+  written largely by the same system that wrote the code. Please read
+  `assembly/header.py` and `assembly/packer.py` before trusting a multi-gigabyte
+  archive with your models.
+- **Bugs are likely and reports are welcome.** Open an issue with the command
+  you ran and what you expected. If the failure is silent — a wrong number
+  rather than an error — that is the most valuable kind of report there is.
 
 ## License
 

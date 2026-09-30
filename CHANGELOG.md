@@ -33,8 +33,32 @@ First public release.
   `assembly_context` in HTTP responses, so clients stop replaying turns that
   are no longer being sent.
 
+### Added
+
+- An interrupted build no longer risks leaving a broken multi-gigabyte file.
+  The archive is assembled under a `.partial-<pid>` temporary name and renamed
+  into place only after the bytes are written and the header reads back
+  correctly, so a half-written `.asmb` is never presented as a valid archive.
+  Ctrl-C already cleaned up after itself; `kill -9` and a power cut could not,
+  so an abandoned temporary file is now reclaimed by the next build, which
+  removes only those whose owning process is definitely gone. The temporary
+  name carries the writer's pid, which also stops two concurrent builds to the
+  same output from colliding. The rename is followed by an fsync of the
+  directory so it survives a power cut.
+
 ### Fixed
 
+- Streaming responses did not report the context window, while the
+  non-streaming and Ollama paths did. A client that maintains conversation
+  history had no way to learn its turns had been compressed, on the most common
+  way of talking to the server. A final `assembly_context`-only frame now
+  precedes `[DONE]`.
+- Reading a model's metadata for its context length read less than the split
+  reader reads, so a model with unusually large tokenizer metadata ahead of the
+  context key would look as though it declared none and the window would
+  silently collapse to the fallback. The read now escalates to the same 64 MiB
+  the split reader uses, but only after a smaller read comes up empty, so the
+  common case still costs nothing.
 - A conversation that outgrew the context window produced a `200` followed by
   an SSE error frame, and printed a full traceback to the server console.
   llama-cpp-python tokenises lazily, on the first advance of the streaming

@@ -272,6 +272,22 @@ class ModelManager:
             self._models.clear()
 
 
+def _note_chunk(model_label: str, note: dict[str, Any]) -> dict[str, Any]:
+    """A final SSE frame carrying only context metadata.
+
+    Shaped like any other chunk so a client that walks deltas does not trip
+    over an unfamiliar frame, and carrying no choices so it cannot be
+    mistaken for content.
+    """
+    return {
+        "id": "assembly-context",
+        "object": "chat.completion.chunk",
+        "model": model_label,
+        "assembly_context": note,
+        "choices": [],
+    }
+
+
 def _context_overflow(exc: Exception) -> str | None:
     """Turn llama.cpp's context-window error into something actionable.
 
@@ -739,6 +755,11 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                 return False
 
         model_label = f"{alias}:{route.model_name}"
+        # Told once, at the end. A client replaying a whole history needs to
+        # know that the turns it sent are no longer being sent, and that is
+        # only knowable after the generation which compressed them. Extra keys
+        # on a chunk are ignored by clients that only read the text.
+        note = self._context_note(llm)
         try:
             # Replay the chunk that was pulled while priming.
             chunks = [] if first_chunk is None else [first_chunk]
@@ -763,6 +784,7 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
                 message = f"generation failed: {type(exc).__name__}"
             emit(f"data: {json.dumps({'error': {'message': message}})}\n\n")
 
+        emit(f"data: {json.dumps(_note_chunk(model_label, note))}\n\n")
         emit("data: [DONE]\n\n")
 
     def _handle_completions(self, body: dict[str, Any], is_openai: bool = True) -> None:
