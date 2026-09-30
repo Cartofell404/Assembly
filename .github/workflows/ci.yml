@@ -27,19 +27,29 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      # The unit tests never import llama_cpp: assembly/wrapper.py imports it
+      # lazily inside the load path. Installing the full dependency set would
+      # make CI compile llama.cpp from source on every matrix entry, which takes
+      # many minutes and needs a C++ toolchain for no extra coverage. So install
+      # the package with --no-deps plus just the imports the tests do need.
+      # The real dependency set is still exercised by `pip install assembly`
+      # for users, and by the smoke test below.
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install pytest pytest-cov numpy
+          pip install --no-deps -e .
 
-      # The unit tests never import llama_cpp, so they stay fast and do not
-      # need a C++ toolchain. Building it here would triple CI time for
-      # zero additional coverage.
       - name: Test
-        run: pytest -q --cov=assembly --cov-report=term-missing
+        run: pytest -q --cov=assembly --cov-report=term-missing --cov-branch
 
       - name: Compile check
         run: python -m compileall -q assembly
+
+      # Guards the lazy-import optimisation above: if llama_cpp ever becomes a
+      # top-level import, the test job passes but this one catches it.
+      - name: Confirm the test env has no llama_cpp
+        run: python -c "import llama_cpp" && exit 1 || echo "as expected"
 
   build:
     runs-on: ubuntu-latest
@@ -54,12 +64,22 @@ jobs:
       - name: Check metadata
         run: |
           python - <<'PY'
-          import pathlib, zipfile
+          import pathlib, tarfile
+
           sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
-          with zipfile.ZipFile(sdist) as z:
-              names = z.namelist()
+          # A .tar.gz is a tarball; zipfile cannot open it.
+          with tarfile.open(sdist, "r:gz") as tf:
+              names = tf.getnames()
           assert any(n.endswith("LICENSE") for n in names), "LICENSE missing from sdist"
-          print("ok:", sdist.name)
+          assert any(n.endswith("assembly/__init__.py") for n in names), "package missing"
+
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          import zipfile
+          with zipfile.ZipFile(wheel) as zf:
+              names = zf.namelist()
+          assert any(n.endswith("assembly/__init__.py") for n in names), "package missing from wheel"
+          assert any(n.endswith("assembly/__main__.py") for n in names), "__main__ missing from wheel"
+          print("ok:", sdist.name, wheel.name)
           PY
       - uses: actions/upload-artifact@v4
         with:

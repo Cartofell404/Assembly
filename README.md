@@ -2,6 +2,10 @@
 
 **Multi-model GGUF router with llama-cpp-python**
 
+[![CI](https://github.com/assembly-engine/assembly/actions/workflows/ci.yml/badge.svg)](https://github.com/assembly-engine/assembly/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 Assembly Engine combines 1 embedding model (router) and N execution models (≥ 2) into a single binary `.asmb` file. When a prompt arrives, the engine computes a fast embedding, measures Cosine Similarity against pre-defined text anchors, selects the best model via `mmap`, and generates the response.
 
 > **Note on disk usage.** On Linux the archive is memory-mapped and model blobs
