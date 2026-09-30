@@ -2461,6 +2461,40 @@ class TestContextReporting:
         assert "4,096" in text
         assert "b" in text
 
+    def test_an_undeclared_model_lowers_the_reported_window(self):
+        """The fallback must reach the client, not just the model.
+
+        Taking the minimum of the *declared* lengths would report 131,072 for
+        an archive actually running at 2,048, and a client sizing off that
+        would overflow every request.
+        """
+        from unittest.mock import MagicMock
+        from assembly.server import ModelManager
+        from assembly.wrapper import AssemblyLlama, FALLBACK_CONTEXT
+
+        llm = MagicMock(spec=AssemblyLlama)
+        llm.model_contexts = {"Code": 131072, "Mystery": None}
+        llm.context_window = FALLBACK_CONTEXT
+
+        mgr = ModelManager()
+        mgr._models = {"a.asmb": llm}
+        assert mgr.context_window() == FALLBACK_CONTEXT
+        assert "fallback" in mgr.describe_context()
+
+    def test_a_fully_declared_archive_reports_its_smallest(self):
+        from unittest.mock import MagicMock
+        from assembly.server import ModelManager
+        from assembly.wrapper import AssemblyLlama
+
+        llm = MagicMock(spec=AssemblyLlama)
+        llm.model_contexts = {"Code": 131072, "General": 131072}
+        llm.context_window = 131072
+
+        mgr = ModelManager()
+        mgr._models = {"a.asmb": llm}
+        assert mgr.context_window() == 131072
+        assert "fallback" not in mgr.describe_context()
+
     def test_health_reports_the_window(self):
         from assembly.server import AssemblyRequestHandler
         from unittest.mock import MagicMock

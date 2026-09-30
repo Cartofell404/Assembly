@@ -209,15 +209,33 @@ class ModelManager:
         return ", ".join(names) or "none loaded"
 
     def context_window(self) -> Optional[int]:
-        """The smallest context window across every loaded model."""
+        """The context window actually in use, across every loaded archive.
+
+        Read from each archive rather than recomputed from its models. An
+        archive whose models do not all declare a length falls back to a
+        conservative default, and taking the minimum of the declared lengths
+        instead would quietly report the optimistic number: overstating the
+        window by 64x invites a client to send prompts that cannot fit.
+        """
         with self._lock:
             windows = [
                 value
                 for llm in self._models.values()
-                for value in (getattr(llm, "model_contexts", None) or {}).values()
+                for value in (self._declared_window(llm),)
                 if value
             ]
         return min(windows) if windows else None
+
+    @staticmethod
+    def _declared_window(llm: Any) -> Optional[int]:
+        """The window one archive resolved to, or None if it has none."""
+        window = getattr(llm, "context_window", None)
+        if isinstance(window, int) and window > 0:
+            return window
+        # A stand-in without a resolved window: fall back to its models.
+        contexts = getattr(llm, "model_contexts", None) or {}
+        known = [v for v in contexts.values() if v]
+        return min(known) if known else None
 
     def describe_context(self) -> str:
         """The context window in use, and which model decided it."""
@@ -235,6 +253,13 @@ class ModelManager:
 
         smallest = sorted(n for n, v in windows.items() if v == window)
         suffix = f"  (smallest: {', '.join(smallest)})" if smallest else ""
+        undeclared = sorted(n for n, v in windows.items() if not v)
+        if undeclared:
+            # Be explicit rather than letting a conservative default look like
+            # a real reading: the number is a fallback, not a measurement.
+            suffix += (
+                f"  (fallback: {', '.join(undeclared)} declare none)"
+            )
         return f"{window:,} tokens{suffix}"
 
     def close(self) -> None:
