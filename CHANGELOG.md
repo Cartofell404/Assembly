@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 First public release.
 
+### Fixed
+
+- Model loading copied every blob into RAM instead of mapping it. Slicing an
+  `mmap` object returns `bytes`, so a 4 GB model was duplicated on each load
+  and then crashed on `memoryview.release()`. Blobs are now taken as
+  `memoryview(self._mm)[a:b]`, which is a true zero-copy view.
+- `run --temp-dir` was parsed but never passed to the loader, so the flag
+  silently did nothing.
+- A leaked file descriptor on the Linux `memfd_create` staging path: the
+  duplicated descriptor was never closed.
+- `StagingError` was accidentally decorated with `@contextmanager`, turning
+  the exception class into a function, so raising it would have failed.
+- The browser chat page could not authenticate against a server started with
+  `--api-key`; it now prompts once and keeps the key in `sessionStorage`.
+- `/chat` was itself behind the auth gate, which made the page unreachable in
+  a browser (browsers cannot attach an `Authorization` header to a
+  navigation). The static shell is now public; every data endpoint stays
+  authenticated.
+- `assembly info` leaked a file descriptor on a corrupt archive and did not
+  `expanduser()` its argument.
+- A model file that disappears between validation and `stat()` produced a
+  traceback instead of a validation error.
+- `PreflightError` was being raised with a message where a validation report
+  is required; build failures now raise a distinct `BuildError`.
+- Sharded GGUFs (`model-00001-of-00003.gguf`) are now rejected. llama.cpp
+  cannot load a shard on its own, so such a file packed into a clean-looking
+  archive and then failed at inference with `invalid split file name`.
+  `validate` and `build` report it before copying anything, and the loader
+  fails in under a second instead of after staging gigabytes.
+- A model that fails to load now reports which model, from which archive, and
+  why, instead of a raw `ValueError` naming an internal temp file — and the
+  CLI prints that message rather than a traceback.
+- A `Ctrl+C` at the CLI now exits quietly with status 130 instead of printing a
+  `KeyboardInterrupt` traceback, and a closed pipe (`... | head`) exits 0.
+
+### Changed
+
+- `setup.py` removed in favour of `pyproject.toml` metadata.
+- `assembly -i/--interactive` removed; a REPL is already the default when no
+  prompt is given.
+- Version reported as `0.1.0` and sourced from `assembly/__init__.py`, which
+  `pyproject.toml` now reads dynamically.
+- `python -m assembly` now works alongside the `assembly` console script.
+- The test suite no longer ships a hand-rolled runner that could not support
+  the fixtures its own tests use; pytest is the single entry point.
+
+
 ### Added
 
 - `assembly build` packs an embedding model and two or more execution models

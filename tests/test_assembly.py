@@ -7,45 +7,21 @@ validation) without requiring actual GGUF model files or llama-cpp-python.
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import pathlib
-import struct
 import sys
-import tempfile
+from typing import Any
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import numpy as np
-
-try:
-    import pytest
-except ImportError:
-    import re
-    class _RaisesContext:
-        def __init__(self, expected_exc, match=None):
-            self.expected_exc = expected_exc
-            self.match = match
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if exc_type is None:
-                raise AssertionError(f"{self.expected_exc} not raised")
-            if not issubclass(exc_type, self.expected_exc):
-                return False
-            if self.match and not re.search(self.match, str(exc_val)):
-                raise AssertionError(f"Pattern {self.match!r} did not match {exc_val!r}")
-            return True
-
-    class _PytestMock:
-        raises = _RaisesContext
-    pytest = _PytestMock()
-
 # ── Header tests ─────────────────────────────────────────────────────
 
 from assembly.header import (
-    MAGIC,
     PAGE_SIZE,
     PREAMBLE_SIZE,
     AsmbHeader,
@@ -878,7 +854,7 @@ class TestServer:
 
     def test_openai_and_ollama_endpoints(self):
         from unittest.mock import MagicMock
-        from assembly.router import RouteResult
+
         from assembly.server import ModelManager
 
         mgr = ModelManager()
@@ -947,9 +923,53 @@ class TestServer:
         assert body["done"] is True
 
 
-import argparse  # noqa: E402 — used by TestCLI
-import os  # noqa: E402 — used in TestPackerLayout
 
+
+
+
+    def test_web_chat_shell_is_public_but_data_is_not(self):
+        """The HTML shell must load so the UI can prompt for the key; the
+        data behind it must still require the token."""
+        from assembly.server import ModelManager, WEB_CHAT_HTML
+
+        mgr = ModelManager()
+        status, headers, _ = self._execute(
+            mgr,
+            b"GET /chat HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n",
+            api_key="secret",
+        )
+        assert status == 200, "chat shell must be reachable without a token"
+        assert "text/html" in headers["content-type"]
+        assert "fetchWithAuth" in WEB_CHAT_HTML
+
+        # Everything that actually returns data stays gated.
+        for path in (b"/health", b"/v1/models", b"/api/info", b"/api/tags"):
+            status, _, _ = self._execute(
+                mgr,
+                b"GET " + path + b" HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                api_key="secret",
+            )
+            assert status == 401, f"{path.decode()} leaked data without a token"
+
+    def test_root_html_shell_is_public_when_key_is_set(self):
+        from assembly.server import ModelManager
+
+        status, _, _ = self._execute(
+            ModelManager(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n",
+            api_key="secret",
+        )
+        assert status == 200
+
+    def test_root_json_is_still_gated(self):
+        from assembly.server import ModelManager
+
+        status, _, _ = self._execute(
+            ModelManager(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n",
+            api_key="secret",
+        )
+        assert status == 401
 
 # ── Packer integrity ──────────────────────────────────────────────────
 
@@ -1144,7 +1164,6 @@ class TestCLI:
         assert "No such archive" in capsys.readouterr().err
 
     def test_info_rejects_corrupt_archive(self, tmp_path, capsys):
-        from assembly.header import InvalidArchiveError
         from assembly.main import _cmd_info
 
         bad = tmp_path / "bad.asmb"
@@ -1171,6 +1190,86 @@ class TestCLI:
             _cmd_build(args)
         assert exc.value.code == 1
         assert "disk gave up" in capsys.readouterr().err
+
+
+# ── Web UI ──────────────────────────────────────────────────────────────
+
+
+class TestWebUI:
+    """Guards the HTML/JS embedded in server.py.
+
+    WEB_CHAT_HTML is a normal (non-raw) Python string, so a JS escape like
+    ``\\n`` is consumed by *Python* and lands in the page as a literal newline.
+    Inside a JS string literal that is an immediate SyntaxError, which would
+    ship a completely dead chat page with no test failing. These checks catch
+    that class of mistake.
+    """
+
+    def _script(self) -> str:
+        import re
+
+        from assembly.server import WEB_CHAT_HTML
+
+        match = re.search(r"<script>(.*)</script>", WEB_CHAT_HTML, re.S)
+        assert match, "WEB_CHAT_HTML has no <script> block"
+        return match.group(1)
+
+    @staticmethod
+    def _unescaped_quote_count(line: str) -> int:
+        count, escaped = 0, False
+        for ch in line:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                count += 1
+        return count
+
+    def test_js_block_is_extracted(self):
+        assert len(self._script()) > 500
+
+    def test_no_string_literal_is_split_across_lines(self):
+        """Every JS line must close its quotes; an odd count means breakage."""
+        offenders = [
+            (n, line)
+            for n, line in enumerate(self._script().split("\n"), 1)
+            if self._unescaped_quote_count(line) % 2
+        ]
+        assert not offenders, (
+            "JS string literal opened but not closed on line(s): "
+            + "; ".join(f"{n}: {line.strip()[:60]!r}" for n, line in offenders)
+        )
+
+    def test_braces_and_parens_are_balanced(self):
+        script = self._script()
+        assert script.count("{") == script.count("}")
+        assert script.count("(") == script.count(")")
+
+    def test_escape_sequences_survive_python_parsing(self):
+        """A \\n written in the JS must still be an escape, not a newline."""
+        script = self._script()
+        for literal in ('"Authorization": "Bearer "', "assembly_api_key"):
+            assert literal in script
+
+    def test_fetch_calls_go_through_the_auth_wrapper(self):
+        """Plain fetch() cannot send a bearer token; the UI must use the wrapper."""
+        script = self._script()
+        assert "fetchWithAuth" in script
+        assert 'fetch("/v1/chat/completions"' not in script
+        assert 'fetch("/api/info"' not in script
+
+    def test_model_names_are_not_injected_as_html(self):
+        from assembly.server import WEB_CHAT_HTML
+
+        script = self._script()
+        # Strip // comments so the explanatory comment mentioning innerHTML
+        # does not trip the check; what matters is that it is never assigned.
+        code = "\n".join(
+            line.split("//")[0] for line in script.split("\n")
+        )
+        assert "innerHTML" not in code
+        assert "assembly_name" in WEB_CHAT_HTML
 
 
 # ── Staging directory ─────────────────────────────────────────────────
@@ -1236,6 +1335,185 @@ class TestStaging:
 
 
 # ── Config robustness ─────────────────────────────────────────────────
+
+class TestSplitGGUFDetection:
+    """A shard of a split GGUF builds cleanly but can never load.
+
+    llama.cpp refuses any file whose metadata declares it belongs to a split,
+    so catching this at validate time is the difference between a clear error
+    and a broken model discovered after a multi-hour build.
+    """
+
+    @staticmethod
+    def _gguf(kv_pairs: dict[str, tuple[int, int]]) -> bytes:
+        """Minimal GGUF v3 header carrying the given uint32 key/value pairs."""
+        import struct as _s
+
+        out = bytearray(b"GGUF")
+        out += _s.pack("<I", 3)          # version
+        out += _s.pack("<QQ", 0, len(kv_pairs))  # 0 tensors, n_kv
+
+        for key, (vtype, value) in kv_pairs.items():
+            out += _s.pack("<Q", len(key)) + key.encode()
+            out += _s.pack("<I", vtype)
+            out += _s.pack("<I", value)
+
+        return bytes(out)
+
+    def _write(self, tmp_path, blob: bytes, name="m.gguf") -> pathlib.Path:
+        p = tmp_path / name
+        p.write_bytes(blob)
+        return p
+
+    def test_detects_split_count_and_index(self, tmp_path):
+        from assembly.config import gguf_split_info
+
+        blob = self._gguf({
+            "general.architecture": (8, 0),   # a STRING value would need bytes;
+            "split.count": (4, 2),             # here we only exercise ints
+            "split.no": (4, 1),
+        })
+        # Drop the STRING key we cannot encode this way; keep the split ones.
+        blob = self._gguf({"split.count": (4, 2), "split.no": (4, 1)})
+        assert gguf_split_info(self._write(tmp_path, blob)) == (2, 1)
+
+    def test_plain_model_reports_nothing(self, tmp_path):
+        from assembly.config import gguf_split_info
+
+        blob = self._gguf({"general.file_type": (4, 15)})
+        assert gguf_split_info(self._write(tmp_path, blob)) == (None, None)
+
+    def test_single_part_split_is_fine(self, tmp_path):
+        from assembly.config import gguf_split_info
+
+        blob = self._gguf({"split.count": (4, 1), "split.no": (4, 0)})
+        assert gguf_split_info(self._write(tmp_path, blob)) == (1, 0)
+
+    def test_garbage_does_not_raise(self, tmp_path):
+        from assembly.config import gguf_split_info
+
+        for blob in (b"", b"NOPE", b"GGUF", b"GGUF" + b"\xff" * 32,
+                     self._gguf({"split.count": (4, 2)})[:40]):
+            assert gguf_split_info(self._write(tmp_path, blob)) == (None, None)
+
+    def test_preflight_errors_on_a_shard(self, tmp_path):
+        from assembly.config import validate_assembly_preflight
+
+        for name in ("emb.gguf", "m1.gguf", "m2.gguf"):
+            (tmp_path / name).write_bytes(self._gguf({"general.file_type": (4, 15)}))
+        # Only the second execution model is a shard.
+        (tmp_path / "m2.gguf").write_bytes(
+            self._gguf({"split.count": (4, 2), "split.no": (4, 1)})
+        )
+
+        cfg = {
+            "assembly_name": "sharded",
+            "embedding": {"name": "emb", "path": str(tmp_path / "emb.gguf"),
+                          "confidence_threshold": 0.7, "fallback_model": "m1"},
+            "models": [
+                {"name": "m1", "path": str(tmp_path / "m1.gguf"), "anchors": ["a", "b"]},
+                {"name": "m2", "path": str(tmp_path / "m2.gguf"), "anchors": ["c", "d"]},
+            ],
+        }
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(cfg))
+
+        report = validate_assembly_preflight(path)
+        errors = [i for i in report.errors if i.severity == "ERROR"]
+        assert any("split GGUF" in i.message and "'m2'" in i.message for i in errors), \
+            [i.message for i in errors]
+
+    def test_loader_rejects_a_shard_before_staging_it(self, tmp_path, monkeypatch):
+        """The check must precede the multi-gigabyte staging copy."""
+        import mmap
+
+        from assembly import wrapper
+        from assembly.header import (
+            AsmbHeader,
+            EmbeddingEntry,
+            InvalidArchiveError,
+            ModelEntry,
+            write_preamble,
+        )
+
+        router = self._gguf({"general.file_type": (4, 15)})
+        shard = self._gguf({"split.count": (4, 2), "split.no": (4, 1)})
+        blob_size = 1 << 20
+        blob = shard + b"\x00" * (blob_size - len(shard))
+
+        header = AsmbHeader(
+            assembly_name="shard-test",
+            embedding=EmbeddingEntry(name="router", offset=4096, size=len(router),
+                                     confidence_threshold=0.7, fallback_model="m1"),
+            models=[ModelEntry(name="m1", offset=8192, size=blob_size, anchors=["a"])],
+        )
+        hjson = header.to_json_bytes()
+        pre = bytearray()
+        write_preamble(pre, len(hjson))
+
+        path = tmp_path / "shard.asmb"
+        path.write_bytes(
+            bytes(pre) + hjson
+            + b"\x00" * (4096 - len(pre) - len(hjson))
+            + router + b"\x00" * (4096 - len(router))
+            + blob
+        )
+
+        staged = []
+
+        class _Boom:
+            def __enter__(self_inner):
+                staged.append("staged")
+                return "unused"
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        monkeypatch.setattr(wrapper, "_memfd_model",
+                            lambda name, data: _Boom())
+
+        llm = wrapper.AssemblyLlama.__new__(wrapper.AssemblyLlama)
+        llm._mm = None
+        llm._asmb_path = path
+
+        with open(path, "rb") as fh:
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            llm._mm = mm
+            try:
+                with pytest.raises(InvalidArchiveError, match="split GGUF"):
+                    llm._load_llama_from_mmap(
+                        name="m1", offset=8192, size=blob_size
+                    )
+            finally:
+                mm.close()
+
+        assert staged == [], "must not stage a blob that cannot be loaded"
+
+    def test_cli_reports_load_failures_without_a_traceback(self, monkeypatch, capsys):
+        from assembly import main as main_mod
+        from assembly.wrapper import StagingError
+
+        def boom(_args):
+            raise StagingError("not enough space to stage Code: need 4.0 GB")
+
+        monkeypatch.setattr(main_mod, "_cmd_info", boom)
+        with pytest.raises(SystemExit) as exc:
+            main_mod.main(["info", "-m", "x.asmb"])
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "not enough space to stage Code" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_cli_exits_130_on_interrupt(self, monkeypatch, capsys):
+        from assembly import main as main_mod
+
+        def boom(_args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(main_mod, "_cmd_info", boom)
+        with pytest.raises(SystemExit) as exc:
+            main_mod.main(["info", "-m", "x.asmb"])
+        assert exc.value.code == 130
 
 class TestConfigRobustness:
     def _write(self, tmp_path, **overrides):
@@ -1343,10 +1621,14 @@ class TestHeaderStrictness:
             read_header(buf)
 
     def test_non_page_aligned_offset_is_rejected(self):
-        import json as _json
-
-        from assembly.header import InvalidArchiveError, write_preamble
-        from assembly.header import read_header, AsmbHeader, EmbeddingEntry, ModelEntry
+        from assembly.header import (
+            AsmbHeader,
+            EmbeddingEntry,
+            InvalidArchiveError,
+            ModelEntry,
+            read_header,
+            write_preamble,
+        )
 
         header = AsmbHeader(
             assembly_name="misaligned",
@@ -1362,10 +1644,9 @@ class TestHeaderStrictness:
             read_header(bytes(pre) + blob + b"\x00" * 64)
 
     def test_blob_past_end_of_archive_is_rejected(self):
-        from assembly.header import InvalidArchiveError, read_header
-
         import json as _json
-        from assembly.header import write_preamble
+
+        from assembly.header import InvalidArchiveError, read_header, write_preamble
 
         doc = _json.dumps({
             "assembly_name": "oob",
@@ -1380,53 +1661,3 @@ class TestHeaderStrictness:
 
         with pytest.raises(InvalidArchiveError, match="past the end"):
             read_header(bytes(pre) + doc)
-
-
-if __name__ == "__main__":
-    import inspect
-    import shutil
-
-    total = 0
-    passed = 0
-    failed = 0
-
-    test_classes = [
-        TestAlignToPage,
-        TestPreamble,
-        TestAsmbHeader,
-        TestConfig,
-        TestPreflight,
-        TestRouter,
-        TestPackerLayout,
-        TestPersona,
-        TestServer,
-        TestPackerIntegrity,
-        TestCLI,
-        TestStaging,
-        TestConfigRobustness,
-        TestHeaderStrictness,
-    ]
-
-    for cls in test_classes:
-        instance = cls()
-        for name, method in inspect.getmembers(instance, predicate=inspect.ismethod):
-            if name.startswith("test_"):
-                total += 1
-                tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="asmb_test_"))
-                try:
-                    sig = inspect.signature(method)
-                    if "tmp_path" in sig.parameters:
-                        method(tmp_dir)
-                    else:
-                        method()
-                    passed += 1
-                    print(f"  ✓ {cls.__name__}.{name}")
-                except Exception as exc:
-                    failed += 1
-                    print(f"  ✗ {cls.__name__}.{name}: {exc}")
-                finally:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    print(f"\nResults: {passed}/{total} passed, {failed} failed.")
-    if failed:
-        sys.exit(1)

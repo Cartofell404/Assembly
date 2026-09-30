@@ -116,6 +116,15 @@ assembly build -c config.json -o my_models.asmb
 anything, so a broken config fails in milliseconds instead of after a multi-hour
 copy. Nothing is written to the output file unless validation passes.
 
+Validation also catches models that could never load:
+
+- a file that is not a real GGUF (corrupt download),
+- **a shard of a split GGUF** (`model-00001-of-00003.gguf`). Large models are
+  often published as shards; llama.cpp refuses to load one alone, so packing
+  it produces an archive that builds cleanly and then fails at inference.
+  Merge the shards into a single `.gguf` first,
+- a model file that changed or vanished since validation.
+
 ### 3. Start the Server Daemon (`assembly serve`)
 
 Like `ollama serve`, you can start an HTTP server that runs in the background or on a dedicated machine/server:
@@ -228,19 +237,24 @@ assembly run -m my_models.asmb "hi" 2>/dev/null | pbcopy
 
 ### 5. Multi-device & External Scripts Access
 
-The server exposes standard, universal APIs:
+The server exposes standard, universal APIs. On a loopback server with no API
+key configured, no credentials are needed. On a server started with
+`--api-key` (which is mandatory for any non-loopback bind), every request must
+carry that key as a bearer token — including these examples.
 
 #### A. OpenAI Python SDK (works from any machine/script)
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://192.168.1.50:8000/v1",  # IP of your Assembly server
-    api_key="assembly",                      # Any string
+    base_url="http://192.168.1.50:8000/v1",       # IP of your Assembly server
+    api_key=os.environ["ASSEMBLY_API_KEY"],      # the real key; any value
+                                                   # only if the server has none
 )
 
 response = client.chat.completions.create(
-    model="assembly",
+    model="default",
     messages=[{"role": "user", "content": "Napisz funkcję w Pythonie"}],
 )
 print(response.choices[0].message.content)
@@ -250,19 +264,27 @@ print(response.choices[0].message.content)
 ```bash
 # OpenAI-compatible Chat
 curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $ASSEMBLY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Tell me a joke"}]}'
+  -d '{"model":"default","messages": [{"role": "user", "content": "Tell me a joke"}]}'
 
 # Ollama-compatible API
 curl -X POST http://localhost:8000/api/chat \
+  -H "Authorization: Bearer $ASSEMBLY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model":"default","messages": [{"role": "user", "content": "Hello!"}]}'
 
 # Check router decision without full generation
 curl -X POST http://localhost:8000/api/route \
+  -H "Authorization: Bearer $ASSEMBLY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Debug this memory leak"}'
 ```
+
+The browser chat at `/chat` asks for the key on first use and keeps it in
+`sessionStorage` for that tab only. The page itself is served without a token
+(browsers cannot attach an `Authorization` header to a page navigation), but
+everything it loads — model names and completions — is authenticated.
 
 ### 6. Inspect an archive
 

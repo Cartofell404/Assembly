@@ -215,8 +215,8 @@ def _require_archive(path: str) -> str:
         ui.error(f"No such archive: {resolved}")
         print()
         print(f"  {ui.Color.DIM}Build one with:{ui.Color.RESET}")
-        print(f"    assembly init")
-        print(f"    assembly validate -c assembly.config.json")
+        print("    assembly init")
+        print("    assembly validate -c assembly.config.json")
         print(f"    assembly build -c assembly.config.json -o {resolved.name}")
         print()
         print(f"  {ui.Color.DIM}Already have one? Point at it with -m /path/to/file.asmb,{ui.Color.RESET}")
@@ -301,6 +301,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
             n_ctx=args.n_ctx,
             n_gpu_layers=args.n_gpu_layers,
             verbose=args.verbose,
+            temp_dir=args.temp_dir,
         )
 
     backend = _LocalBackend(asmb)
@@ -352,8 +353,8 @@ def _load_on_server(
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            pass
+        with urllib.request.urlopen(req, timeout=30):
+            pass  # response body is irrelevant; a 2xx is the whole signal
     except Exception as exc:
         ui.warn(f"Could not request server to load model: {exc}")
 
@@ -974,7 +975,29 @@ session commands: /help /info /model /route /clear /persona /bye
 def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        # Ctrl+C is a normal way to leave a session or stop a server.
+        print()
+        sys.exit(130)
+    except BrokenPipeError:
+        # e.g. `assembly run ... | head`: exit quietly.
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        sys.exit(0)
+    except (InvalidArchiveError, RuntimeError, OSError) as exc:
+        # InvalidArchiveError is a ValueError; StagingError is a RuntimeError,
+        # so this covers both without importing the heavier wrapper module.
+        # These are all failures a user can act on. A traceback here would only
+        # bury the one useful sentence in a wall of library frames.
+        if type(exc) is RuntimeError and not str(exc):
+            raise  # not one of ours; keep the traceback
+        ui.error(str(exc))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

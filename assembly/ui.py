@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Iterator
 
 # Check if colors should be enabled (TTY + not NO_COLOR)
 _USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ

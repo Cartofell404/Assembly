@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -224,6 +225,138 @@ def _safe_size(
         return -1
 
 
+def gguf_split_info(path: pathlib.Path) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(split_count, split_no)`` from a GGUF header on disk."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64 << 20)
+    except OSError:
+        return (None, None)
+    return gguf_split_info_from_bytes(head)
+
+
+def gguf_split_info_from_bytes(head: bytes) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(split_count, split_no)`` from the first bytes of a GGUF.
+
+    Large models are often published as shards (``model-00001-of-00003.gguf``).
+    llama.cpp refuses to load any shard whose metadata declares it is part of a
+    split, so such a file can be copied into an archive and byte-verified
+    perfectly and still be unloadable at runtime. Detecting it early turns a
+    multi-gigabyte staging attempt followed by a confusing failure into an
+    immediate, actionable error.
+
+    Returns ``(None, None)`` when the bytes have no split metadata or cannot be
+    parsed; callers must treat that as "not checked", never as "invalid".
+    """
+    import io
+
+    # gguf value type id -> fixed byte width (STRING/ARRAY handled separately)
+    fixed = {0: 1, 1: 1, 7: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 10: 8, 11: 8, 12: 8}
+
+    fh = io.BytesIO(head)
+
+    def read_str() -> None:
+        raw = fh.read(8)
+        if len(raw) < 8:
+            raise ValueError("truncated")
+        (n,) = struct.unpack("<Q", raw)
+        if n > (1 << 20):
+            raise ValueError("implausible string length")
+        raw2 = fh.read(n)
+        if len(raw2) < n:
+            raise ValueError("truncated")
+        return raw2.decode("utf-8", "replace")
+
+    def skip_value(t: int) -> None:
+        if t == 8:
+            read_str()
+        elif t == 9:  # ARRAY
+            (elem,) = struct.unpack("<I", fh.read(4))
+            (count,) = struct.unpack("<Q", fh.read(8))
+            if elem == 8:
+                for _ in range(count):
+                    read_str()
+            elif elem in fixed:
+                if fixed[elem] * count > len(head):
+                    raise ValueError("truncated")
+                fh.seek(fixed[elem] * count, os.SEEK_CUR)
+            else:
+                raise ValueError("unknown array element type")
+        elif t in fixed:
+            if fixed[t] > len(head):
+                raise ValueError("truncated")
+            fh.seek(fixed[t], os.SEEK_CUR)
+        else:
+            raise ValueError("unknown value type")
+
+    try:
+        if fh.read(4) != b"GGUF":
+            return (None, None)
+        if len(fh.read(4)) < 4:
+            return (None, None)
+        _, n_kv = struct.unpack("<QQ", fh.read(16))
+
+        split_count: Optional[int] = None
+        split_no: Optional[int] = None
+        for _ in range(n_kv):
+            key_start = fh.tell()
+            raw = fh.read(8)
+            if len(raw) < 8:
+                return (None, None)
+            (klen,) = struct.unpack("<Q", raw)
+            if klen > 4096:
+                return (None, None)
+            key_raw = fh.read(klen)
+            if len(key_raw) < klen:
+                return (None, None)
+            key = key_raw.decode("utf-8", "replace")
+            (vtype,) = struct.unpack("<I", fh.read(4))
+
+            if key in ("split.count", "split.no"):
+                width = fixed.get(vtype)
+                if width is None:
+                    return (None, None)
+                raw_value = fh.read(width)
+                if len(raw_value) < width:
+                    return (None, None)
+                value = int.from_bytes(raw_value, "little", signed=vtype in (1, 3, 5, 11))
+                if key == "split.count":
+                    split_count = value
+                else:
+                    split_no = value
+            else:
+                fh.seek(key_start + 8 + klen + 4, os.SEEK_SET)
+                skip_value(vtype)
+        return (split_count, split_no)
+    except (struct.error, ValueError, UnicodeError):
+        return (None, None)
+
+
+def _check_not_sharded(
+    path: pathlib.Path,
+    field: str,
+    label: str,
+    issues: list[ValidationIssue],
+) -> None:
+    """Record an error when *path* is one shard of a split GGUF."""
+    split_count, split_no = gguf_split_info(path)
+    if split_count is None or split_count <= 1:
+        return
+
+    who = f" '{label}'" if label else ""
+    issues.append(
+        ValidationIssue(
+            "ERROR",
+            field,
+            f"Model{who} is shard {split_no + 1} of {split_count} from a split "
+            f"GGUF. llama.cpp cannot load a shard on its own, so this model "
+            f"would fail at inference time even though the archive builds "
+            f"cleanly. Merge the shards into one .gguf file (or download the "
+            f"single-file version) and point the config at that.",
+        )
+    )
+
+
 def validate_assembly_preflight(
     config_path: str | pathlib.Path,
     output_path: Optional[str | pathlib.Path] = None,
@@ -370,6 +503,9 @@ def validate_assembly_preflight(
                             )
                         )
 
+                    if check_gguf_magic:
+                        _check_not_sharded(emb_path, "embedding.path", "", issues)
+
                 models_info.append(
                     {
                         "role": "router_embedding",
@@ -467,6 +603,11 @@ def validate_assembly_preflight(
                                     f"Could not read model file '{m_name}': {e}",
                                 )
                             )
+
+                    if check_gguf_magic:
+                        _check_not_sharded(
+                            m_path, f"models[{idx}].path", str(m_name), issues
+                        )
 
                     anchors = m.get("anchors", [])
                     models_info.append(

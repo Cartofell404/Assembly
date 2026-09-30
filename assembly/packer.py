@@ -24,7 +24,6 @@ import mmap
 import os
 import pathlib
 import sys
-from typing import Optional
 
 from assembly.config import AssemblyConfig, PreflightError, validate_assembly_preflight
 from assembly.header import (

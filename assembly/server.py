@@ -331,8 +331,33 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
     # GET Handlers
     # ─────────────────────────────────────────────────────────────────
 
+    def _is_public_shell(self) -> bool:
+        """True for the static chat page, which may be served without a token.
+
+        The page is a self-contained HTML shell: no model names, no data, and
+        no key are embedded in it — everything it renders comes from /api/info
+        and /v1/chat/completions, which stay authenticated. A browser cannot
+        attach an Authorization header to a top-level navigation, so gating
+        the page itself would make the UI permanently unreachable on an
+        authenticated server.
+        """
+        path = self.path.split("?")[0]
+        accept = self.headers.get("Accept", "")
+        return path == "/chat" or (path == "/" and "text/html" in accept)
+
     def do_GET(self) -> None:
         """Authenticate, dispatch, and never leak a traceback to the client."""
+        if self._is_public_shell():
+            try:
+                self._send_html(WEB_CHAT_HTML)
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+            except Exception as exc:
+                logger.exception("Unhandled error serving web UI")
+                self._safe_error(f"internal error: {type(exc).__name__}",
+                                 HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         if not self._authorized():
             self._deny()
             return
@@ -347,12 +372,6 @@ class AssemblyRequestHandler(BaseHTTPRequestHandler):
 
     def _route_get(self) -> None:
         path = self.path.split("?")[0]
-        accept = self.headers.get("Accept", "")
-
-        # Serve Web Chat UI for browsers opening the root URL or /chat
-        if path == "/chat" or (path == "/" and "text/html" in accept):
-            self._send_html(WEB_CHAT_HTML)
-            return
 
         if path in ("/", "/health"):
             models = self.server.manager.list_models()
@@ -698,7 +717,7 @@ def serve(
     persona: Optional[str] = None,
     n_ctx: int = 2048,
     n_gpu_layers: int = 0,
-    verbose: bool = True,
+    verbose: bool = False,
     api_key: Optional[str] = None,
     allow_origin: Optional[str] = None,
     models_dir: Optional[str | Path] = None,
@@ -916,12 +935,40 @@ const sendBtn = document.getElementById("send-btn");
 const modelBadge = document.getElementById("model-badge");
 let conversation = [];
 
+// When the server runs with --api-key, this page has to authenticate too or
+// every request comes back 401. The key is kept in sessionStorage only: it is
+// per-tab, cleared on close, and never appended to a URL or written to disk.
+function authHeaders() {
+  const key = sessionStorage.getItem("assembly_api_key");
+  return key ? { "Authorization": "Bearer " + key } : {};
+}
+
+function promptForKey() {
+  const key = window.prompt("This server requires an API key. Enter the key used to start it:");
+  if (!key) return false;
+  sessionStorage.setItem("assembly_api_key", key.trim());
+  return true;
+}
+
+async function fetchWithAuth(path, options = {}, retried = false) {
+  const res = await fetch(path, {
+    ...options,
+    headers: { ...authHeaders(), ...(options.headers || {}) }
+  });
+  if (res.status === 401 && !retried && promptForKey()) {
+    return fetchWithAuth(path, options, true);
+  }
+  return res;
+}
+
 async function updateInfo() {
   try {
-    const res = await fetch("/api/info");
+    const res = await fetchWithAuth("/api/info");
     if (res.ok) {
       const data = await res.json();
       modelBadge.textContent = "⚡ " + data.assembly_name + " (" + data.models.length + " sub-models)";
+    } else if (res.status === 401) {
+      modelBadge.textContent = "🔒 API key required";
     }
   } catch(e) {}
 }
@@ -946,7 +993,7 @@ async function sendMessage() {
   const loadingRow = appendMsg("assistant", "Thinking...");
 
   try {
-    const res = await fetch("/v1/chat/completions", {
+    const res = await fetchWithAuth("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: conversation, max_tokens: 512 })
@@ -954,6 +1001,11 @@ async function sendMessage() {
     const data = await res.json();
     loadingRow.remove();
 
+    if (res.status === 401) {
+      appendMsg("assistant", "Unauthorized: check the API key for this server.");
+      conversation.pop();
+      return;
+    }
     if (data.choices && data.choices[0]) {
       const reply = data.choices[0].message ? data.choices[0].message.content : data.choices[0].text;
       const routeInfo = data.assembly_route || {};

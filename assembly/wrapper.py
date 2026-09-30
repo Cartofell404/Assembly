@@ -35,6 +35,7 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 
+from assembly.config import gguf_split_info_from_bytes
 from assembly.header import PREAMBLE_SIZE, AsmbHeader, InvalidArchiveError, read_header
 from assembly.router import RouteResult, Router
 
@@ -169,6 +170,20 @@ def _memfd_model(name: str, data: memoryview | bytes) -> Iterator[str]:
             _write_blob(tmp, data)
             tmp.flush()
             yield tmp.name
+
+
+def _describe_load_failure(exc: Exception) -> str:
+    """Turn a llama.cpp load failure into something a user can act on."""
+    detail = str(exc).strip() or type(exc).__name__
+
+    if "split file" in detail:
+        return (
+            "llama.cpp rejected it as a shard of a split GGUF "
+            "(only part of the model was present)"
+        )
+    if "magic" in detail.lower():
+        return f"the model data is not valid GGUF ({detail})"
+    return f"llama.cpp could not load the model ({detail})"
 
 
 class _ModelSlot:
@@ -358,6 +373,21 @@ class AssemblyLlama:
                 f"archive holds {available})"
             )
 
+        # Check the metadata before staging. A shard of a split GGUF cannot be
+        # loaded by llama.cpp at all, and staging costs a multi-gigabyte copy,
+        # so there is no reason to discover that after the write.
+        split_count, split_no = gguf_split_info_from_bytes(
+            bytes(model_view[: (64 << 20)])
+        )
+        if split_count is not None and split_count > 1:
+            model_view.release()
+            raise InvalidArchiveError(
+                f"model '{name}' in {self._asmb_path.name} is shard "
+                f"{split_no + 1} of {split_count} from a split GGUF, which "
+                f"llama.cpp cannot load on its own. Rebuild the archive from a "
+                f"single merged .gguf file."
+            )
+
         try:
             with _memfd_model(name, model_view) as model_path:
                 return self._Llama(
@@ -392,11 +422,25 @@ class AssemblyLlama:
                 f"Loading execution model '{entry.name}' "
                 f"({entry.size / 1e6:.1f} MB, offset {entry.offset:#x})"
             )
-            llm = self._load_llama_from_mmap(
-                name=entry.name,
-                offset=entry.offset,
-                size=entry.size,
-            )
+            try:
+                llm = self._load_llama_from_mmap(
+                    name=entry.name,
+                    offset=entry.offset,
+                    size=entry.size,
+                )
+            except InvalidArchiveError:
+                raise
+            except Exception as exc:
+                # llama.cpp reports a sharded GGUF as
+                # "invalid split file name", and a damaged blob as a generic
+                # load failure. Both arrive as ValueError from a temp path the
+                # user has never seen, so restate them in terms they can act on.
+                raise RuntimeError(
+                    f"could not load execution model '{entry.name}' from "
+                    f"{self._asmb_path.name}: {_describe_load_failure(exc)}. "
+                    f"If this model came from a sharded download, it must be "
+                    f"merged into a single .gguf before it can be packed."
+                ) from exc
             slot = _ModelSlot(
                 name=entry.name,
                 llama=llm,
