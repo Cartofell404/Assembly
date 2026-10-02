@@ -13,10 +13,10 @@ Two commands matter: **`assembly serve`** hosts the archive over HTTP, and
 `build`, `info`) exist to get an archive built in the first place.
 
 > **Note on disk usage.** On Linux the archive is memory-mapped and model blobs
-> are handed to `llama.cpp` as anonymous in-memory files. On macOS
+> are handed to `llama.cpp` as anonymous in-memory files. On macOS and Windows
 > `llama.cpp` requires a real path, so each model is staged as a temporary file
-> on first use. The archive is never extracted, but the first run on macOS
-> does read each model from disk. See [macOS staging](#macos-staging-and-disk-usage).
+> on first use. The archive is never extracted, but the first run does read each
+> model from disk. See [staging](#staging-and-disk-usage).
 
 ## Terminal output
 
@@ -25,7 +25,7 @@ single orange palette; cream is reserved for the model's own text so a reply
 is never confused for chrome.
 
 - **stdout is only ever the answer.** Banners, spinners, warnings and routing
-  badges all go to stderr, so `assembly run -m models.asmb "hi" | pbcopy`
+  badges all go to stderr, so `assembly run -m /path/to/models.asmb "hi" | pbcopy`
   yields the reply and nothing else.
 - Honours `NO_COLOR` and non-TTY output — redirected output contains no escape
   sequences at all.
@@ -58,9 +58,17 @@ Prompt → Embed → Cosine Similarity → Select Model → Generate
 pip install -e .
 ```
 
-Requires `llama-cpp-python`, `numpy` and `rich`. `llama-cpp-python` compiles from
-source on most platforms; install a prebuilt wheel for yours if a C++
-toolchain is unavailable.
+Requires Python 3.10+ and works on Linux, macOS and Windows. Needs
+`llama-cpp-python`, `numpy` and `rich`. `llama-cpp-python` compiles from source
+on most platforms; install a prebuilt wheel for yours if a C++ toolchain is
+unavailable — on Windows that means Visual Studio Build Tools, and a wheel is
+much the better option. See [Windows notes](#windows-notes).
+
+On Windows, add the `history` extra for REPL line editing and saved history:
+
+```bash
+pip install -e ".[history]"
+```
 
 Check the install with:
 
@@ -178,11 +186,16 @@ Like `ollama serve`, you can start an HTTP server that runs in the background or
 
 ```bash
 # Start server with an active .asmb archive (binds to 127.0.0.1:8000 by default)
-assembly serve -m my_models.asmb
+assembly serve -m /path/to/my_models.asmb
 
 # Custom host and port
-assembly serve -m my_models.asmb --host 127.0.0.1 --port 9000
+assembly serve -m /path/to/my_models.asmb --host 127.0.0.1 --port 9000
 ```
+
+`-m` is required and must be an **absolute path**. Assembly will not guess the
+archive from your working directory — serving from the wrong folder used to load
+whatever `.asmb` happened to be sitting in it, and then hand that archive to
+every client that asked.
 
 Other clients on this machine can now reach it:
 
@@ -199,7 +212,7 @@ endpoint on a network is open to anyone who can reach the port:
 
 ```bash
 export ASSEMBLY_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-assembly serve -m my_models.asmb --host 0.0.0.0
+assembly serve -m /path/to/my_models.asmb --host 0.0.0.0
 ```
 
 Clients then send it as a bearer token:
@@ -217,10 +230,26 @@ out, and the number of concurrently loaded models is bounded.
 
 | Flag | Purpose |
 | --- | --- |
-| `--api-key KEY` | Require `Authorization: Bearer KEY` (or set `$ASSEMBLY_API_KEY`) |
+| `--api-key KEY` | Require `Authorization: Bearer KEY` (or set `$ASSEMBLY_API_KEY`). ASCII only; the env var is preferable, since argv is visible to other processes |
 | `--allow-origin ORIGIN` | Allow one CORS origin, e.g. `http://localhost:5173`. Omitted by default: no browser origin may call the server |
-| `--models-dir DIR` | Confine the `/api/load` endpoint to `.asmb` files inside `DIR` |
-| `--temp-dir DIR` | Where model blobs are staged on macOS (see below) |
+| `--models-dir DIR` | Confine the `/api/load` endpoint to `.asmb` files inside `DIR`. Defaults to the served archive's directory |
+| `--temp-dir DIR` | Where model blobs are staged off Linux (see below) |
+
+See [Security model](#security-model) for what these do and do not cover —
+in particular, there is no TLS, so anything beyond loopback needs a proxy.
+
+#### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health`, `/` | Status, version, loaded count, active alias, context window |
+| `GET` | `/v1/models`, `/api/tags` | OpenAI/Ollama-compatible model listing |
+| `GET` | `/api/models`, `/api/info` | Loaded archives; archive header details |
+| `POST` | `/api/load` | Load an `.asmb` (`model_path`, optional `alias`, `persona`) |
+| `POST` | `/api/unload` | Free a slot (`alias`); returns the aliases still loaded |
+| `POST` | `/api/route` | Router decision for a prompt, no generation |
+| `POST` | `/v1/chat/completions`, `/api/chat` | OpenAI/Ollama-compatible chat |
+| `POST` | `/v1/completions`, `/api/generate` | Raw completion |
 
 #### Context window
 
@@ -229,7 +258,7 @@ time and uses the **smallest** context length declared by any of the archive's
 execution models, so a request is never sized for a model that cannot hold it:
 
 ```bash
-assembly serve -m my_models.asmb   # banner shows: Context  131,072 tokens
+assembly serve -m /path/to/my_models.asmb   # banner shows: Context  131,072 tokens
 ```
 
 There is deliberately no flag to override it. A caller-chosen window can
@@ -280,24 +309,24 @@ so it never becomes a second way for a request to fail.
 
 ```bash
 # Connect to a running server on localhost:8000, or to another device on your LAN:
-assembly run -m my_models.asmb            # interactive session
+assembly run -m /path/to/my_models.asmb            # interactive session
 assembly run -s http://192.168.1.50:8000  # remote server
 
 # One-shot: answer a single prompt and exit
-assembly run -m my_models.asmb "Write quicksort in Python"
-assembly run -m my_models.asmb -p "Kim jesteś?"
+assembly run -m /path/to/my_models.asmb "Write quicksort in Python"
+assembly run -m /path/to/my_models.asmb -p "Kim jesteś?"
 
 # Show which sub-model answered each turn
-assembly run -m my_models.asmb --route
+assembly run -m /path/to/my_models.asmb --route
 
 # Forget the conversation between turns
-assembly run -m my_models.asmb --no-memory
+assembly run -m /path/to/my_models.asmb --no-memory
 ```
 
 The session is deliberately plain — an arrow, your question, the answer:
 
 ```
-$ assembly run -m my_models.asmb
+$ assembly run -m /path/to/my_models.asmb
 Mesh-1.0 · Code, General, Reasoning
 /help for commands · Ctrl+C or Ctrl+D to exit
 
@@ -380,7 +409,7 @@ through when present, which makes runs reproducible.
 the answer and nothing else:
 
 ```bash
-assembly run -m my_models.asmb "hi" 2>/dev/null | pbcopy
+assembly run -m /path/to/my_models.asmb "hi" 2>/dev/null | pbcopy
 ```
 
 ### 5. Multi-device & External Scripts Access
@@ -435,8 +464,73 @@ interface, and every endpoint is a plain API for your own scripts.
 ### 6. Inspect an archive
 
 ```bash
-assembly info -m my_models.asmb
+assembly info -m /path/to/my_models.asmb
 ```
+
+## Security model
+
+Read this before exposing the server to anything other than your own machine.
+It states what the server does and does not protect against.
+
+### Intended deployment
+
+A **single-user, single-tenant, local-first** service: one operator, on their
+own machine, over a socket they control. It is not hardened as a shared or
+public service, and the limits below are the honest edges of that.
+
+### What the server does enforce
+
+| Control | Behaviour |
+| --- | --- |
+| Bind address | Loopback (`127.0.0.1`) by default. A non-loopback `--host` is **refused at startup** unless a key is set. |
+| Authentication | One bearer token, compared in constant time. Optional on loopback, mandatory off it. |
+| `/api/load` jail | Confined to `--models-dir`, which defaults to the served archive's own directory. Resolved, so `..` and symlinks cannot escape. |
+| Browser access | `Host` must name loopback; no CORS origin is allowed unless you pass `--allow-origin`; cross-origin writes are refused. Together these close the DNS-rebinding and CSRF routes into a keyless local server. |
+| Capacity | At most 8 loaded archives and 32 concurrent connections. Further loads get `429`; further connections are closed. |
+| Request size | 1 MiB body cap, checked against `Content-Length` before a byte is read. Chunked encoding is refused. |
+| Stalled clients | A 300-second wall-clock deadline per connection, not just a per-recv socket timeout. |
+| Error detail | Errors report a status and a reason. Staging paths, free space, and archive header offsets go to the log, never to the client. |
+| Log hygiene | Prompts and tokens are never logged; attacker-supplied text (paths, aliases, origins, hosts) has control characters stripped before it reaches the log. |
+
+### What it does **not** protect against
+
+- **Plaintext transport.** There is no TLS. On anything but loopback, your
+  bearer token and every prompt travel in cleartext, readable by anyone on the
+  path. Terminate TLS in a reverse proxy, or tunnel over SSH/WireGuard. Do not
+  expose the port to an untrusted network directly.
+- **Brute force and rate limiting.** There is no per-client rate limit and no
+  lockout. Failed attempts are logged for audit, but nothing slows guessing. A
+  short, high-entropy key is what protects you.
+- **Multiple users.** There are no accounts, roles, quotas, or per-user model
+  limits. Anyone holding the key has the full API, including `/api/load`.
+- **Concurrent generation.** Generation is serialised per archive, so a second
+  request queues behind the first rather than running in parallel. With the
+  connection ceiling, several long generations can queue up; there is no
+  fairness or cancellation.
+- **Malicious archives.** An `.asmb` is parsed by llama.cpp **in this process**.
+  Only load archives you built or otherwise trust. `/api/load` restricting paths
+  is not a substitute for that.
+- **Argv exposure.** `--api-key` is visible to other processes via `ps`. Prefer
+  `ASSEMBLY_API_KEY`, and keep it ASCII (non-ASCII keys are rejected at
+  startup, because HTTP headers are Latin-1 on the wire).
+
+### Operational notes
+
+```bash
+# Recommended: key from the environment, and a directory you own
+export ASSEMBLY_API_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+assembly serve -m /path/to/my_models.asmb --models-dir ~/models
+```
+
+- `assembly serve` requires `-m`, and it must be an **absolute** path. The
+  archive path is never guessed from the working directory, so starting the
+  server in the wrong folder cannot silently load whatever `.asmb` is there.
+  Because `serve` always has an archive, `/api/load` is always confined to that
+  archive's own directory unless you pass `--models-dir`. (Only a direct
+  `assembly.server.serve()` call from Python can leave it unconfined.)
+- Freeing a slot at the model limit: `POST /api/unload {"alias": "..."}`.
+- Audit trail: failed auth, refused origins, foreign hosts, refused connections,
+  and model load failures are logged at `WARNING` and above.
 
 ## Python API (In-Process)
 
@@ -470,7 +564,7 @@ with AssemblyLlama("my_models.asmb", verbose=True) as llm:
    - `MAX_SCORE < threshold` **and** `fallback_model` is set → use fallback.
    - `MAX_SCORE < threshold` **and** `fallback_model` is `null` → use best anyway.
 
-## macOS staging and disk usage
+## Staging and disk usage
 
 `.asmb` archives are memory-mapped, never extracted. How the model bytes reach
 `llama.cpp` differs by platform:
@@ -478,25 +572,54 @@ with AssemblyLlama("my_models.asmb", verbose=True) as llm:
 - **Linux** — each blob is copied into an anonymous in-memory file
   (`memfd_create`) and passed as `/proc/self/fd/N`. There is no staging copy on
   disk at all.
-- **macOS** — `llama.cpp` requires a real filesystem path, so each model is
-  written to a temporary file before it is loaded. The archive itself is still
-  only read; nothing is duplicated wholesale, but the models do pass through
-  the temp volume, and the first `run` after a cold start will be slower than
-  subsequent ones.
+- **macOS and Windows** — `llama.cpp` requires a real filesystem path, so each
+  model is written to a temporary file before it is loaded. The archive itself
+  is still only read; nothing is duplicated wholesale, but the models do pass
+  through the temp volume, and the first `run` after a cold start will be
+  slower than subsequent ones.
 
 If the system temp volume is small or slow, point staging elsewhere. The
 directory is created if needed, and free space is checked before a multi-
 gigabyte write begins:
 
 ```bash
-assembly run -m my_models.asmb --temp-dir /Volumes/Fast/assembly
+# macOS
+assembly run -m /path/to/my_models.asmb --temp-dir /Volumes/Fast/assembly
+# Windows
+assembly run -m /path/to/my_models.asmb --temp-dir D:\NVMe\assembly
 # or, for both run and serve:
-export ASSEMBLY_TEMP_DIR=/Volumes/Fast/assembly
+export ASSEMBLY_TEMP_DIR=/Volumes/Fast/assembly   # or: set ASSEMBLY_TEMP_DIR=D:\NVMe\assembly
 ```
 
 Free space is reported up front, before copying, so a volume that is too small
 produces a clear message instead of an out-of-space error partway through a
 load.
+
+A directory you pass to `--temp-dir` is yours: Assembly never deletes it. The
+private `assembly-*` directory it creates inside is removed at exit, along with
+any staged blob still on disk.
+
+## Windows notes
+
+Assembly runs on Windows, macOS and Linux from the same codebase, and CI covers
+all three. The Windows specifics worth knowing:
+
+- **`llama-cpp-python` wheels.** Prefer a prebuilt wheel over a source build; it
+  needs Visual Studio Build Tools otherwise. Point pip at the wheel index for
+  your accelerator, for example
+  `pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`.
+- **Terminal colour.** Modern terminals (Windows Terminal, and Windows 10+
+  conhost) render the full palette. On a legacy console, or with
+  `NO_COLOR=1`, output is plain.
+- **REPL history.** `readline` ships with macOS and Linux but not Windows, so
+  without it the REPL has no arrow-key editing or saved history. Install
+  `pip install assembly-engine[history]` (or `pyreadline3`) to get both.
+- **Rebuilding a served archive.** Windows will not replace a file another
+  process has open, so stop `assembly serve` before rebuilding over a live
+  archive. The error says so rather than reporting a bare permission failure.
+- **Long paths.** Paths over 260 characters need long-path support enabled
+  (Windows 10 1607+ with the registry setting, or the `\\?\` prefix). Relevant
+  if your models live deep in a directory tree.
 
 ## Project Structure
 

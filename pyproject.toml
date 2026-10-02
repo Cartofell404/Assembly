@@ -14,7 +14,11 @@ authors = [{ name = "Assembly Team" }]
 keywords = ["llm", "gguf", "router", "llama.cpp", "inference", "openai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -36,6 +40,12 @@ Issues = "https://github.com/assembly-engine/assembly/issues"
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+]
+# readline is a stdlib module on macOS and Linux but a separate distribution on
+# Windows, where its absence costs the REPL its line editing and history.
+# Declared as a Windows-only extra so macOS/Linux installs are unaffected.
+history = [
+    "pyreadline3>=3.4; sys_platform == 'win32'",
 ]
 
 [project.scripts]

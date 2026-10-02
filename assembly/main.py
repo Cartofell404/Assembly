@@ -19,6 +19,7 @@ assembly info -m archive.asmb
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import sys
@@ -61,10 +62,7 @@ def _cmd_info(args: argparse.Namespace) -> None:
 
     from assembly.header import read_header
 
-    path = Path(args.model).expanduser()
-    if not path.is_file():
-        ui.error(f"No such archive: {path}")
-        sys.exit(1)
+    path = Path(_require_archive(args.model))
 
     # try/finally: a corrupt archive must not leak the descriptor.
     with open(path, "rb") as fh:
@@ -103,16 +101,6 @@ def _cmd_info(args: argparse.Namespace) -> None:
             dim = len(m.anchor_embeddings[0]) if m.anchor_embeddings else 0
             print(f"  embeddings: {n_embs} vectors × {dim} dims")
         print()
-
-
-def _auto_detect_model() -> Optional[Path]:
-    """Auto-detect a single .asmb file in the current working directory."""
-    asmb_files = list(Path(".").glob("*.asmb"))
-    if len(asmb_files) == 1:
-        found = asmb_files[0]
-        ui.info(f"Auto-detected model archive: {found.name}")
-        return found
-    return None
 
 
 def _cmd_init(args: argparse.Namespace) -> None:
@@ -216,8 +204,26 @@ def _cmd_validate(args: argparse.Namespace) -> None:
 
 
 def _require_archive(path: str) -> str:
-    """Fail fast with an actionable message when the archive isn't there."""
+    """Validate the archive argument: absolute, and actually there.
+
+    The path is required to be absolute. Guessing from the working directory
+    meant that serving from the wrong folder silently loaded whatever `.asmb`
+    happened to be sitting in it -- which for a server that then hands the
+    result to a remote client is the wrong failure mode. An explicit absolute
+    path is unambiguous about which archive is about to be parsed.
+    """
     resolved = Path(path).expanduser()
+
+    if not resolved.is_absolute():
+        ui.error(f"the archive path must be absolute: {path}")
+        ui.blank()
+        ui.dim("a relative path depends on which directory you happen to be in,")
+        ui.dim("so the server could load a different archive than you expect.")
+        ui.blank()
+        ui.dim("fix it with the absolute path:")
+        ui.dim(f"  -m {resolved.resolve()}")
+        sys.exit(1)
+
     if not resolved.is_file():
         ui.error(f"no such archive: {resolved}")
         ui.blank()
@@ -227,21 +233,26 @@ def _require_archive(path: str) -> str:
         ui.blank()
         ui.dim("already have one? point at it with -m /path/to/file.asmb")
         sys.exit(1)
+
     return str(resolved)
+
+
+def _require_model_argument(args: argparse.Namespace) -> str:
+    """The archive a command must be told about, validated."""
+    if not args.model:
+        ui.error("no archive given: -m is required.")
+        ui.blank()
+        ui.dim("pass an absolute path to the archive:")
+        ui.dim(f"  assembly {args.command} -m /path/to/models/my_models.asmb")
+        sys.exit(1)
+    return _require_archive(args.model)
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
     """Handle ``assembly serve``."""
     from assembly.server import serve
 
-    model_path = args.model
-    if not model_path:
-        detected = _auto_detect_model()
-        if detected:
-            model_path = str(detected)
-
-    if model_path:
-        model_path = _require_archive(model_path)
+    model_path = _require_model_argument(args)
 
     serve(
         model_path=model_path,
@@ -253,65 +264,36 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         api_key=args.api_key,
         allow_origin=args.allow_origin,
         models_dir=args.models_dir,
+        temp_dir=args.temp_dir,
     )
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
-    """Handle ``assembly run``."""
+    """Handle ``assembly run``.
+
+    Always against a running server. In-process inference used to be the
+    fallback when no server answered, which meant a second, unhardened way in:
+    no bearer token, no ``/api/load`` jail, no request-size or concurrency
+    limit, and unsanitised errors. Routing every request through ``assembly
+    serve`` means one code path, and the one with the limits on it.
+    """
     prompt = args.prompt or args.prompt_pos
-    server_url = args.server
-    explicit_server = bool(server_url)
+    server_url = args.server or "http://127.0.0.1:8000"
 
-    # No explicit target: prefer a live server, else look for a local archive.
-    if not explicit_server and not args.model:
-        server_url = "http://127.0.0.1:8000"
-
-    if server_url and _is_server_available(server_url):
-        if args.model:
-            _load_on_server(server_url, args.model, args.persona)
-
-        backend = _ServerBackend(server_url, args.model)
-        _start_session(backend, prompt, args)
-        return
-
-    if explicit_server:
+    if not _is_server_available(server_url):
         ui.error(f"no Assembly server at {server_url}")
-        ui.dim(f"start one:  assembly serve -m model.asmb --host {urlparse_host(server_url)}")
+        ui.dim(f"start one:  assembly serve -m /path/to/models.asmb --host "
+                f"{urlparse_host(server_url)}")
         sys.exit(1)
 
-    model_path = args.model
-    if not model_path:
-        detected = _auto_detect_model()
-        if detected:
-            model_path = str(detected)
+    # -m is either an alias the server already has loaded, or a path to ask it
+    # to load. Loading is keyed on the .asmb suffix so that a plain alias does
+    # not provoke a pointless /api/load request and the warning that follows.
+    if args.model and Path(args.model).expanduser().suffix == ".asmb":
+        _load_on_server(server_url, args.model, args.persona)
 
-    if not model_path:
-        ui.error("no archive found.")
-        ui.blank()
-        ui.dim("run one of:")
-        ui.dim('  assembly run -m model.asmb -p "your prompt"')
-        print("    cd into a folder with exactly one .asmb   (auto-detected)")
-        print("    assembly serve -m model.asmb              (share over HTTP)")
-        sys.exit(1)
-
-    model_path = _require_archive(model_path)
-
-    from assembly.wrapper import AssemblyLlama
-
-    with ui.status(f"loading {Path(model_path).name}"):
-        asmb = AssemblyLlama(
-            model_path,
-            persona=args.persona,
-                n_gpu_layers=args.n_gpu_layers,
-            verbose=args.verbose,
-            temp_dir=args.temp_dir,
-        )
-
-    backend = _LocalBackend(asmb)
-    try:
-        _start_session(backend, prompt, args)
-    finally:
-        asmb.close()
+    backend = _ServerBackend(server_url, args.model)
+    _start_session(backend, prompt, args)
 
 
 def _start_session(backend: "_Backend", prompt: Optional[str], args: argparse.Namespace) -> None:
@@ -423,70 +405,6 @@ class _Backend:
 
     def warm(self, text: str) -> None:
         """Pre-load whatever *text* will need. Optional; default is a no-op."""
-
-
-class _LocalBackend(_Backend):
-    """In-process inference, straight out of the mmap'd ``.asmb`` archive."""
-
-    def __init__(self, asmb: Any) -> None:
-        self.asmb = asmb
-
-    def describe(self) -> str:
-        h = self.asmb.header
-        return f"{h.assembly_name} · {', '.join(m.name for m in h.models)}"
-
-    def was_summarized(self) -> bool:
-        return bool(getattr(self.asmb, "_last_summarized", False))
-
-    def context_window(self) -> int:
-        return int(getattr(self.asmb, "context_window", 0) or 0)
-
-    def info(self) -> dict[str, Any]:
-        h = self.asmb.header
-        loaded = set(self.asmb.loaded_models)
-        return {
-            "assembly": h.assembly_name,
-            "source": str(self.asmb._asmb_path),
-            "persona": self.asmb.persona,
-            "router": _router_line(h.embedding),
-            "models": [
-                {
-                    "name": m.name,
-                    "size": m.size,
-                    "anchors": len(m.anchors),
-                    "loaded": m.name in loaded,
-                }
-                for m in h.models
-            ],
-        }
-
-    def route(self, text: str) -> tuple[str, float, bool]:
-        r = self.asmb.route(text)
-        return r.model_name, r.score, r.is_fallback
-
-    def warm(self, text: str) -> None:
-        name = self.asmb.route(text).model_name
-        if name in self.asmb.loaded_models:
-            return
-        with ui.status(f"loading {name}"):
-            self.asmb.warm(name)
-
-    def stream(
-        self, messages: list[dict[str, str]], sampling: SamplingParams
-    ) -> Iterator[str]:
-        gen = self.asmb.create_chat_completion(
-            messages, stream=True, **sampling.to_llama_kwargs()
-        )
-        for chunk in gen:
-            if not isinstance(chunk, dict):
-                continue
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta") or {}
-            token = delta.get("content") or choices[0].get("text") or ""
-            if token:
-                yield token
 
 
 class _ServerBackend(_Backend):
@@ -939,10 +857,22 @@ def _handle_command(chat: _Chat, line: str) -> bool:
 
 
 def _enable_readline() -> None:
-    """Line editing plus persistent input history when readline is present."""
+    """Line editing plus persistent input history when readline is present.
+
+    readline is part of the standard library on macOS and Linux but not on
+    Windows, where it ships as a separate distribution. Its absence is not an
+    error: the REPL still works, just without arrow-key editing or history. Say
+    so once, because the difference is otherwise invisible until someone
+    presses Up and nothing happens.
+    """
     try:
         import readline
     except ImportError:
+        if os.name == "nt":
+            ui.dim(
+                "readline is unavailable, so this session has no line editing "
+                "or saved history. `pip install pyreadline3` enables both."
+            )
         return
 
     hist_path = Path(os.path.expanduser("~")) / ".assembly_history"
@@ -952,9 +882,10 @@ def _enable_readline() -> None:
     except OSError:
         pass
 
-    readline.set_history_length(1000)
-
-    import atexit
+    try:
+        readline.set_history_length(1000)
+    except (AttributeError, OSError):
+        pass
 
     def _save() -> None:
         try:
@@ -1018,14 +949,20 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── info ─────────────────────────────────────────────────────────
     p_info = sub.add_parser("info", help="Show .asmb header metadata")
     p_info.add_argument(
-        "-m", "--model", default=None, help=".asmb file path (auto-detected if omitted)"
+        "-m", "--model", default=None, required=True,
+        metavar="/path/to/models.asmb",
+        help="Absolute path to the .asmb archive (required; not guessed from "
+             "the current directory)",
     )
     p_info.set_defaults(func=lambda args: _cmd_info(args))
 
     # ── serve ────────────────────────────────────────────────────────
     p_serve = sub.add_parser("serve", help="Start HTTP API server daemon")
     p_serve.add_argument(
-        "-m", "--model", default=None, help="Initial .asmb file path to load (auto-detected if omitted)"
+        "-m", "--model", default=None, required=True,
+        metavar="/path/to/models.asmb",
+        help="Absolute path to the .asmb archive to load (required; not "
+             "guessed from the current directory)",
     )
     p_serve.add_argument(
         "--host",
@@ -1040,7 +977,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--api-key",
         default=None,
         help="Require 'Authorization: Bearer <key>' on every request. "
-             "Defaults to $ASSEMBLY_API_KEY. Mandatory when not binding loopback.",
+             "Defaults to $ASSEMBLY_API_KEY. Mandatory when not binding loopback. "
+             "ASCII only; prefer the environment variable, since a key passed on "
+             "the command line is visible to other processes via ps.",
     )
     p_serve.add_argument(
         "--allow-origin",
@@ -1051,8 +990,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument(
         "--models-dir",
         default=None,
-        help="Directory the /api/load endpoint may read .asmb files from "
-             "(default: current directory).",
+        help="Directory the /api/load endpoint may read .asmb files from. "
+             "Defaults to the directory holding the served archive, so a "
+             "client can load its siblings but nothing else on the disk. "
+             "Widening this to a shared directory such as the system temp "
+             "directory hands every client on the host the ability to open any "
+             "readable .asmb; prefer a directory you own and serve from there.",
     )
     p_serve.add_argument(
         "--temp-dir",
@@ -1076,17 +1019,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser(
         "run",
         help="Chat with an assembly",
-        description="Chat with an .asmb archive. With no prompt it opens an "
-                    "interactive session.",
+        description="Chat with an .asmb archive on a running server. With no "
+                    "prompt it opens an interactive session.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
+requires a running server; there is no standalone inference mode.
+
 examples:
-  assembly run -m mesh.asmb                      open a chat session
-  assembly run -m mesh.asmb "hello"              one-shot answer
-  assembly run -m mesh.asmb -p "hi" --route      also show which model answered
-  assembly run -m mesh.asmb --no-memory          forget context each turn
-  assembly run -s http://192.168.1.50:8000       use a running server
-  assembly serve -m mesh.asmb                    share over HTTP
+  assembly serve -m /path/to/mesh.asmb           start the server first
+  assembly run                                   open a chat session
+  assembly run -m /path/to/other.asmb           ask the server to load it
+  assembly run "hello"                           one-shot answer
+  assembly run -p "hi" --route                   also show which model answered
+  assembly run --no-memory                       forget context each turn
+  assembly run -s http://192.168.1.50:8000       use a server elsewhere
 
 session commands: /help /info /model /route /clear /persona /bye
 """,
@@ -1096,19 +1042,20 @@ session commands: /help /info /model /route /clear /persona /bye
         help="Prompt to answer immediately (same as -p)",
     )
     p_run.add_argument(
-        "-m", "--model", default=None, help=".asmb file path (or model alias on server)"
+        "-m", "--model", default=None, metavar="MODEL",
+        help="Absolute path to an .asmb the server should load, or the alias "
+             "of one it already has. An argument ending in .asmb is loaded; "
+             "anything else is used as an alias.",
     )
     p_run.add_argument(
-        "-s", "--server", default=None, help="URL of running Assembly server (e.g. http://localhost:8000)"
+        "-s", "--server", default=None, metavar="URL",
+        help="URL of a running Assembly server (default: http://localhost:8000)",
     )
     p_run.add_argument("-p", "--prompt", default=None, help="Input prompt")
     p_run.add_argument(
         "--persona",
         default=None,
         help="Override or set assistant persona/identity",
-    )
-    p_run.add_argument(
-        "--n-gpu-layers", type=int, default=0, help="GPU layer offload count"
     )
     p_run.add_argument(
         "--max-tokens", type=int, default=256, help="Max tokens to generate"
@@ -1120,16 +1067,6 @@ session commands: /help /info /model /route /clear /persona /bye
     p_run.add_argument(
         "--no-memory", action="store_true",
         help="Send each prompt on its own, without conversation history",
-    )
-    p_run.add_argument(
-        "--temp-dir",
-        default=None,
-        help="Directory used to stage model blobs (default: $ASSEMBLY_TEMP_DIR "
-             "or the system temp directory). Point this at a fast volume with "
-             "room for the largest model.",
-    )
-    p_run.add_argument(
-        "-v", "--verbose", action="store_true", help="Verbose loading logs"
     )
     p_run.set_defaults(func=_cmd_run)
 

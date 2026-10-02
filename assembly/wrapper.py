@@ -9,8 +9,8 @@ Design constraints
   whole model store.  llama.cpp needs a real filesystem path to mmap a
   model, so each blob is staged into a temporary file that is deleted as
   soon as it is loaded: an anonymous in-memory fd on Linux (``memfd_create``)
-  and a temp file on macOS and other platforms.  On macOS that staging copy
-  is real disk I/O — see ``assembly_temp_dir`` and ``--temp-dir``.
+  and a temp file everywhere else.  Off Linux that staging copy is real disk
+  I/O — see ``assembly_temp_dir`` and ``--temp-dir``.
 * **Lazy model loading.**  Only the embedding model is loaded at init
   time.  Execution models are loaded on-demand and cached so that
   switching back to a previously used model is instantaneous.
@@ -23,6 +23,7 @@ Design constraints
 
 from __future__ import annotations
 
+import atexit
 import mmap
 import os
 import shutil
@@ -85,7 +86,44 @@ TEMPLATE_OVERHEAD = 96
 TEMP_DIR_ENV = "ASSEMBLY_TEMP_DIR"
 
 _TEMP_DIR: Optional[Path] = None
+#: Whether _TEMP_DIR is one we created. A directory the user pointed us at with
+#: --temp-dir is theirs and must never be deleted on their behalf.
+_TEMP_DIR_OWNED = False
 _TEMP_DIR_LOCK = threading.Lock()
+
+#: Staged blobs whose removal failed, retried at exit. On Windows a mapped model
+#: stays locked for as long as llama.cpp holds it, so the unlink at unload time
+#: is expected to fail; by the time the process exits the mapping is gone. These
+#: paths are ours alone (mkstemp names), and removing them never touches the
+#: directory itself, so this works for a user-supplied --temp-dir too.
+_PENDING_UNLINK: set[Path] = set()
+_PENDING_UNLINK_LOCK = threading.Lock()
+
+
+def _defer_unlink(path: Path) -> None:
+    """Record *path* for removal at exit."""
+    with _PENDING_UNLINK_LOCK:
+        _PENDING_UNLINK.add(path)
+
+
+def _flush_pending_unlinks() -> None:
+    """Remove any staged blob that could not be deleted earlier."""
+    while True:
+        with _PENDING_UNLINK_LOCK:
+            if not _PENDING_UNLINK:
+                return
+            path = _PENDING_UNLINK.pop()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Still locked, or the volume is gone. Requeue and give up rather
+            # than spinning forever on a file that will never open up.
+            with _PENDING_UNLINK_LOCK:
+                if len(_PENDING_UNLINK) < 64:
+                    _PENDING_UNLINK.add(path)
+            return
 
 
 def configure_temp_dir(directory: str | Path) -> Path:
@@ -95,7 +133,7 @@ def configure_temp_dir(directory: str | Path) -> Path:
     is not a directory — a silent fallback to the system temp directory would
     just hand the user a confusing out-of-space error much later.
     """
-    global _TEMP_DIR
+    global _TEMP_DIR, _TEMP_DIR_OWNED
     target = Path(directory).expanduser()
     try:
         target.mkdir(parents=True, exist_ok=True)
@@ -107,18 +145,19 @@ def configure_temp_dir(directory: str | Path) -> Path:
         raise StagingError(f"staging path is not a directory: {target}")
 
     with _TEMP_DIR_LOCK:
-        # Drop the previously created staging root; the per-model files
-        # inside it are unlinked as their context managers exit, so the
-        # directory itself is all that leaks.
-        if _TEMP_DIR is not None and _TEMP_DIR != target:
+        # Only ever remove a directory we created ourselves. A user-supplied
+        # --temp-dir is theirs: it may already hold other files, and deleting
+        # it to "clean up staging" would take those with it.
+        if _TEMP_DIR is not None and _TEMP_DIR != target and _TEMP_DIR_OWNED:
             shutil.rmtree(_TEMP_DIR, ignore_errors=True)
         _TEMP_DIR = target
+        _TEMP_DIR_OWNED = False
     return target
 
 
 def assembly_temp_dir() -> Path:
     """Return (creating once) the directory used to stage model blobs."""
-    global _TEMP_DIR
+    global _TEMP_DIR, _TEMP_DIR_OWNED
     with _TEMP_DIR_LOCK:
         if _TEMP_DIR is None:
             configured = os.environ.get(TEMP_DIR_ENV)
@@ -132,7 +171,25 @@ def assembly_temp_dir() -> Path:
                     f"writable volume."
                 ) from exc
             _TEMP_DIR = Path(tempfile.mkdtemp(prefix="assembly-", dir=str(base)))
+            # We own this one, so we are allowed to remove it at exit.
+            _TEMP_DIR_OWNED = True
         return _TEMP_DIR
+
+
+def cleanup_temp_dir() -> None:
+    """Remove the staging directory, if we created it.
+
+    Registered with :mod:`atexit` so a normal exit does not leave a directory
+    behind. Only ever touches a directory this process made for itself; a
+    user-supplied ``--temp-dir`` or ``ASSEMBLY_TEMP_DIR`` is left alone, as is
+    any staged blob still held open.
+    """
+    global _TEMP_DIR, _TEMP_DIR_OWNED
+    with _TEMP_DIR_LOCK:
+        if _TEMP_DIR is None or not _TEMP_DIR_OWNED:
+            return
+        directory, _TEMP_DIR, _TEMP_DIR_OWNED = _TEMP_DIR, None, False
+    shutil.rmtree(directory, ignore_errors=True)
 
 
 def free_bytes_at(directory: Path) -> int:
@@ -141,6 +198,15 @@ def free_bytes_at(directory: Path) -> int:
         return shutil.disk_usage(str(directory)).free
     except OSError:
         return 0
+
+
+# Registered at import so a normal interpreter exit reclaims the staging
+# directory without every caller having to remember to. This only ever removes a
+# directory this process created; see cleanup_temp_dir.
+atexit.register(cleanup_temp_dir)
+# Registered second so it runs *first*: a pending blob must be unlinked while
+# its mapping is gone but before anything else touches the directory.
+atexit.register(_flush_pending_unlinks)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -169,12 +235,18 @@ def _memfd_model(name: str, data: memoryview | bytes) -> Iterator[str]:
     On Linux this is an anonymous in-memory file (``memfd_create``) — no
     visible path and no directory entry at all.
 
-    Everywhere else, including macOS, the blob is staged as a real file in a
-    private temp directory.  That copy is genuine disk I/O, so we check for
-    room first and raise a readable error rather than an ``Errno 28`` from the
-    middle of a multi-gigabyte write.
+    Everywhere else, including macOS and Windows, the blob is staged as a real
+    file in a private temp directory.  That copy is genuine disk I/O, so we
+    check for room first and raise a readable error rather than an ``Errno 28``
+    from the middle of a multi-gigabyte write.
+
+    The staged file is written, closed and only then handed to llama.cpp. That
+    ordering is not cosmetic on Windows: an open handle is exclusive enough to
+    stop another process opening the same path, so a file still open when
+    llama.cpp goes to map it would fail with a sharing violation. It also means
+    cleanup cannot rely on ``delete=True`` — see :func:`_stage_blob`.
     """
-    if sys.platform == "linux":
+    if sys.platform == "linux" and hasattr(os, "memfd_create"):
         fd = os.memfd_create(name)  # type: ignore[attr-defined]
         try:
             # The dup is needed so the memfd offset is reset independently of
@@ -187,28 +259,72 @@ def _memfd_model(name: str, data: memoryview | bytes) -> Iterator[str]:
         finally:
             os.close(fd)
     else:
-        staging = assembly_temp_dir()
-        needed = len(data)
-        free = free_bytes_at(staging)
-        if free and free < needed:
-            raise StagingError(
-                f"not enough space to stage {name}: need {needed / 1e9:.1f} GB, "
-                f"only {free / 1e9:.1f} GB free in {staging}. "
-                f"Point ASSEMBLY_TEMP_DIR at a larger volume."
-            )
+        path = _stage_blob(name, data)
         try:
-            tmp = tempfile.NamedTemporaryFile(
-                suffix=".gguf", delete=True, dir=str(staging)
-            )
-        except OSError as exc:
-            raise StagingError(
-                f"could not create a staging file in {staging}: {exc}. "
-                f"Point ASSEMBLY_TEMP_DIR at a writable volume."
-            ) from exc
-        with tmp:
-            _write_blob(tmp, data)
-            tmp.flush()
-            yield tmp.name
+            yield str(path)
+        finally:
+            _unstage_blob(path)
+
+
+def _stage_blob(name: str, data: memoryview | bytes) -> Path:
+    """Write *data* to a fresh file in the staging directory and close it.
+
+    Returns the path. The caller owns cleanup via :func:`_unstage_blob`.
+    """
+    staging = assembly_temp_dir()
+    needed = len(data)
+    free = free_bytes_at(staging)
+    if free and free < needed:
+        raise StagingError(
+            f"not enough space to stage {name}: need {needed / 1e9:.1f} GB, "
+            f"only {free / 1e9:.1f} GB free in {staging}. "
+            f"Point ASSEMBLY_TEMP_DIR at a larger volume."
+        )
+    # mkstemp rather than NamedTemporaryFile: it returns a closed-on-error path
+    # we own outright, and nothing keeps the file open behind our back.
+    try:
+        fd, raw = tempfile.mkstemp(suffix=".gguf", prefix="blob-", dir=str(staging))
+    except OSError as exc:
+        raise StagingError(
+            f"could not create a staging file in {staging}: {exc}. "
+            f"Point ASSEMBLY_TEMP_DIR at a writable volume."
+        ) from exc
+    path = Path(raw)
+    try:
+        with os.fdopen(fd, "wb") as blob:
+            _write_blob(blob, data)
+            blob.flush()
+            os.fsync(blob.fileno())
+    except BaseException:
+        # A partial blob is worse than none: llama.cpp would read a truncated
+        # model and report a generic load failure.
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _unstage_blob(path: Path) -> None:
+    """Remove a staged blob, tolerating a platform that still holds it open.
+
+    Windows keeps a mapped file locked for as long as the mapping lives, and
+    llama.cpp holds the model mapping for the lifetime of the model, not just the
+    load. So this cannot be unconditional: the POSIX case (unlinking an open file
+    is allowed) frees the space immediately, and a failure is remembered for
+    :func:`_flush_pending_unlinks` to retry once the mapping is released. The
+    directory itself is never removed to achieve this, so a user-supplied
+    ``--temp-dir`` ends up without our files and without losing any of theirs.
+    """
+    with _PENDING_UNLINK_LOCK:
+        _PENDING_UNLINK.discard(path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        _defer_unlink(path)
 
 
 def _describe_load_failure(exc: Exception) -> str:

@@ -20,9 +20,11 @@ build never leaves a file that looks loadable.
 
 from __future__ import annotations
 
+import contextlib
 import mmap
 import os
 import pathlib
+import signal
 import sys
 
 from assembly.config import AssemblyConfig, PreflightError, validate_assembly_preflight
@@ -35,6 +37,13 @@ from assembly.header import (
     read_header,
     write_preamble,
 )
+
+
+#: Whether we are running on Windows. Resolved once at import so the platform
+#: decision is a single testable fact rather than an `os.name` read scattered
+#: through the module — and so nothing here mutates `os` globally, which
+#: pathlib.Path consults when it picks a flavour.
+IS_WINDOWS = sys.platform == "win32"
 
 
 class BuildError(RuntimeError):
@@ -51,7 +60,11 @@ def _fsync_dir(directory: pathlib.Path) -> None:
 
     Best effort: some filesystems refuse to open a directory for sync, and
     that is not a reason to fail a build whose bytes are already written.
+    Windows cannot open a directory as a file descriptor at all, so this is
+    always a no-op there.
     """
+    if IS_WINDOWS:
+        return
     try:
         fd = os.open(str(directory), os.O_RDONLY)
     except OSError:
@@ -64,8 +77,97 @@ def _fsync_dir(directory: pathlib.Path) -> None:
         os.close(fd)
 
 
-def _writer_alive(pid: int) -> bool:
-    """Whether *pid* still exists."""
+#: Signals we intercept around a build so an interrupted build cleans up after
+#: itself instead of leaving a partial for the next build to sweep. SIGTERM and
+#: SIGHUP are Unix-only; Windows has neither. SIGINT is included on every
+#: platform because that is what Ctrl-C arrives as, Windows included.
+_BUILD_SIGNALS = [
+    sig
+    for sig in (
+        getattr(signal, name, None)
+        for name in ("SIGTERM", "SIGHUP", "SIGINT")
+    )
+    if sig is not None
+]
+
+
+class _BuildSignalHandler:
+    """Turn a termination signal into an exception the build unwinds through.
+
+    A build writes gigabytes. Ending the process the platform's default way
+    skips every ``finally``, leaving a partial for the next build to sweep.
+    Raising instead routes the signal through the ``except`` that already
+    removes the partial, whether the user pressed Ctrl-C, ran ``kill``, or had
+    their terminal hang up.
+
+    The first signal is therefore never swallowed: a build that takes twenty
+    minutes stays cancellable. A second signal means the unwind itself is
+    stuck, usually unlinking a large file, and an unstoppable build is worse
+    than a leftover partial -- so the handlers are dropped and the signal is
+    re-delivered with its default disposition, which actually ends the process.
+    """
+
+    def __init__(self, signum: int, previous: dict):
+        self._signum = signum
+        self._previous = previous
+        self._seen = False
+
+    def _escalate(self) -> None:
+        for sig in self._previous:
+            try:
+                signal.signal(sig, signal.SIG_DFL)
+            except (OSError, ValueError, TypeError):
+                pass
+        try:
+            # Default disposition: terminates, or raises KeyboardInterrupt for
+            # SIGINT under CPython's handler. Either is the outcome we want.
+            signal.raise_signal(self._signum)
+        except KeyboardInterrupt:
+            pass
+        except (OSError, ValueError, AttributeError):
+            pass
+        # Still here, so the re-delivery did not end the process. Skip the
+        # unwind deliberately rather than pretending it succeeded.
+        os._exit(130)
+
+    def __call__(self, signum, _frame):
+        if self._seen:
+            self._escalate()
+        self._seen = True
+        raise KeyboardInterrupt(
+            f"interrupted by {signal.Signals(signum).name} during build"
+        )
+
+
+def _install_build_signal_handlers() -> dict:
+    """Route interruption signals into the build's own cleanup path.
+
+    Returns a dict suitable for :func:`_restore_signal_handlers`.
+    """
+    previous = {}
+    for sig in _BUILD_SIGNALS:
+        try:
+            previous[sig] = signal.signal(
+                sig, _BuildSignalHandler(sig, previous)
+            )
+        except (OSError, ValueError):
+            # Not the main thread, or the platform disallows it. The build is
+            # still atomic without this; only the partial cleanup is lost.
+            pass
+    return previous
+
+
+def _restore_signal_handlers(previous: dict) -> None:
+    """Put back whatever :func:`_install_build_signal_handlers` replaced."""
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except (OSError, ValueError):
+            pass
+
+
+def _pid_exists_posix(pid: int) -> bool:
+    """Whether *pid* still exists, on platforms with POSIX signal semantics."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -75,6 +177,71 @@ def _writer_alive(pid: int) -> bool:
     except OSError:
         return True
     return True
+
+
+def _pid_exists_windows(pid: int) -> bool:
+    """Whether *pid* still exists, without disturbing the process.
+
+    ``os.kill(pid, 0)`` is the obvious way to probe for a process, but signal 0
+    has no special meaning on Windows: CPython maps every signal except
+    CTRL_C_EVENT and CTRL_BREAK_EVENT straight onto ``TerminateProcess``, so
+    probing with 0 would *kill* the running build we are trying to protect.
+
+    Opening the process for query and reading its exit code is the portable
+    equivalent of a zero-signal probe.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # ctypes defaults every return value to c_int. A HANDLE is pointer-sized,
+    # so on 64-bit Windows an un-annotated call silently truncates the handle:
+    # a perfectly good handle can come back looking like a small integer and
+    # be mistaken for failure. These signatures are required, not decoration.
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+    )
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+    )
+    if not handle:
+        # ERROR_ACCESS_DENIED means the process exists but belongs to another
+        # user or is protected. Erring towards "alive" is the safe direction
+        # here: keeping a stale partial only wastes disk, whereas deleting a
+        # live build's file corrupts a good build.
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            # The handle is valid but the code could not be read. Treat as
+            # alive: the cost of a wrong answer here is asymmetric.
+            return True
+        # A pid that never existed gives OpenProcess's failure path above; here
+        # the handle is real, so the only way to see it is STILL_ACTIVE.
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _writer_alive(pid: int) -> bool:
+    """Whether *pid* still exists."""
+    if IS_WINDOWS:
+        return _pid_exists_windows(pid)
+    return _pid_exists_posix(pid)
 
 
 def _sweep_abandoned(output_path: pathlib.Path) -> None:
@@ -301,16 +468,17 @@ def build(
     # inside llama.cpp. Write to a sibling temp file and rename on success.
     #
     # The temp name carries the writer's pid. Ctrl-C, an exception and a
-    # SIGTERM all unwind into the handler below and clean up after
-    # themselves, but SIGKILL and a power cut never run it -- and an
-    # interrupted 8 GB build is exactly the kind of file worth reclaiming
-    # rather than leaving for someone to find by hand. Carrying the pid
-    # makes a leftover identifiable and sweepable, and stops two concurrent
+    # SIGTERM all unwind into the cleanup below and remove the partial
+    # themselves, but SIGKILL, a power cut and a Windows console close never
+    # run it -- and an interrupted 8 GB build is exactly the kind of file worth
+    # reclaiming rather than leaving for someone to find by hand. Carrying the
+    # pid makes a leftover identifiable and sweepable, and stops two concurrent
     # builds to the same output from writing over each other's partial.
     _sweep_abandoned(output_path)
     tmp_path = output_path.with_name(
         f"{output_path.name}.partial-{os.getpid()}"
     )
+    _previous_handlers = _install_build_signal_handlers()
     try:
         with open(tmp_path, "wb") as out:
             # Preamble
@@ -359,15 +527,34 @@ def build(
                 f"config has {len(cfg.models)}"
             )
 
-        os.replace(tmp_path, output_path)
+        try:
+            os.replace(tmp_path, output_path)
+        except PermissionError as exc:
+            # The usual cause on Windows is a reader holding the archive open:
+            # `assembly serve` keeps the .asmb mapped for the life of the
+            # process, and unlike POSIX, Windows will not replace a file that
+            # anyone has open. Name that case, because "Permission denied" on a
+            # 8 GB build gives the user nothing to act on.
+            raise BuildError(
+                f"cannot replace {output_path}: it is in use by another "
+                f"program. Stop anything serving or reading that archive "
+                f"(for example `assembly serve`) and build again. ({exc})"
+            ) from exc
         # fsync the file before the rename (done above) makes the contents
         # durable; fsyncing the directory makes the rename itself durable.
         # Without this a power cut can leave a correctly written archive
-        # that the directory does not know about.
+        # that the directory does not know about. Windows has no directory
+        # fsync, so _fsync_dir is a no-op there; NTFS commits the rename
+        # through its own journal instead.
         _fsync_dir(output_path.parent)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        # missing_ok swallows the Windows case where the file is locked: the
+        # partial stays behind and the next build sweeps it.
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
         raise
+    finally:
+        _restore_signal_handlers(_previous_handlers)
 
     final_size = output_path.stat().st_size
     print(f"\nBuilt {output_path}  ({final_size / (1024**3):.2f} GiB)")

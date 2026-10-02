@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.10", "3.11", "3.12"]
 
     runs-on: ${{ matrix.os }}
@@ -50,6 +50,18 @@ jobs:
       # top-level import, the test job passes but this one catches it.
       - name: Confirm the test env has no llama_cpp
         run: python -c "import llama_cpp" && exit 1 || echo "as expected"
+
+      # Only runs where it means something. The Windows liveness probe uses
+      # OpenProcess/GetExitCodeProcess, and its correctness is that it does NOT
+      # terminate the process it inspects -- something the portable tests can
+      # only assert against a monkeypatched kernel32. So on a real Windows
+      # runner, run the one test that talks to the actual kernel API.
+      - name: Windows process probe against the real kernel
+        if: runner.os == 'Windows'
+        run: >
+          pytest -q
+          tests/test_assembly.py::TestWindowsProcessProbe::test_the_win32_probe_works_against_a_real_process
+          -rs
 
   build:
     runs-on: ubuntu-latest

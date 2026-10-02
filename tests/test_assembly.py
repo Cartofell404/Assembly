@@ -1111,6 +1111,203 @@ class TestPackerIntegrity:
 
 # ── CLI ───────────────────────────────────────────────────────────────
 
+class TestRunRequiresAServer:
+    """`run` used to fall back to in-process inference with no server running.
+
+    That fallback was a second, unhardened way in: no bearer token, no
+    /api/load jail, no request-size or concurrency cap, unsanitised errors.
+    """
+
+    def _args(self, **over):
+        base = dict(
+            command="run", model=None, server=None, prompt="hi",
+            prompt_pos=None, persona=None, max_tokens=256, route=False,
+            no_memory=False,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def _no_server(self, monkeypatch, url="http://127.0.0.1:8000"):
+        import assembly.main as main_mod
+
+        monkeypatch.setattr(main_mod, "_is_server_available", lambda u: False)
+        monkeypatch.setattr(
+            main_mod, "AssemblyLlama", _explode_if_used, raising=False
+        )
+
+    def test_it_refuses_without_a_server(self, monkeypatch, capsys):
+        import assembly.main as main_mod
+
+        self._no_server(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            main_mod._cmd_run(self._args())
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "no Assembly server" in err
+        # The error has to say how to fix it.
+        assert "assembly serve -m" in err
+
+    def test_it_never_loads_a_model_in_process(self, monkeypatch):
+        """The regression this guards: a local fallback creeping back in."""
+        import assembly.main as main_mod
+
+        self._no_server(monkeypatch)
+        with pytest.raises(SystemExit):
+            main_mod._cmd_run(self._args(model="/models/a.asmb"))
+
+        assert not hasattr(main_mod, "_LocalBackend"), (
+            "the in-process backend is back; run should only speak HTTP"
+        )
+
+    def test_an_explicit_server_is_checked_too(self, monkeypatch, capsys):
+        import assembly.main as main_mod
+
+        self._no_server(monkeypatch, url="http://192.168.1.50:8000")
+        with pytest.raises(SystemExit) as exc:
+            main_mod._cmd_run(self._args(server="http://192.168.1.50:8000"))
+        assert exc.value.code == 1
+        assert "192.168.1.50" in capsys.readouterr().err
+
+    def test_it_defaults_to_localhost(self, monkeypatch):
+        import assembly.main as main_mod
+
+        seen: list = []
+        monkeypatch.setattr(main_mod, "_is_server_available", lambda u: seen.append(u) or True)
+        asked: list = []
+        monkeypatch.setattr(main_mod, "_start_session", lambda *a, **k: asked.append(1))
+
+        main_mod._cmd_run(self._args())
+        assert seen == ["http://127.0.0.1:8000"]
+
+    def test_an_asmb_argument_is_loaded_on_the_server(self, monkeypatch):
+        import assembly.main as main_mod
+
+        monkeypatch.setattr(main_mod, "_is_server_available", lambda u: True)
+        loaded: list = []
+        monkeypatch.setattr(
+            main_mod, "_load_on_server",
+            lambda url, path, persona=None: loaded.append(path),
+        )
+        monkeypatch.setattr(main_mod, "_start_session", lambda *a, **k: None)
+
+        main_mod._cmd_run(self._args(model="/models/a.asmb"))
+        assert loaded == ["/models/a.asmb"]
+
+    def test_a_bare_alias_is_not_sent_to_api_load(self, monkeypatch):
+        """`run -m default` means an alias, not a file to open.
+
+        Sending it to /api/load would fail and print a scary warning about a
+        model that never needed loading.
+        """
+        import assembly.main as main_mod
+
+        monkeypatch.setattr(main_mod, "_is_server_available", lambda u: True)
+        loaded: list = []
+        monkeypatch.setattr(
+            main_mod, "_load_on_server",
+            lambda url, path, persona=None: loaded.append(path),
+        )
+        monkeypatch.setattr(main_mod, "_start_session", lambda *a, **k: None)
+
+        main_mod._cmd_run(self._args(model="default"))
+        assert loaded == []
+
+
+def _explode_if_used(*args, **kwargs):
+    raise AssertionError("run must not do in-process inference")
+
+
+class TestCLIArchivePath:
+    """-m is required, and it must be absolute.
+
+    Auto-detection from the working directory meant that serving from the wrong
+    folder loaded whatever `.asmb` happened to be sitting in it -- and then
+    handed that archive to whoever asked the server.
+    """
+
+    def _parser(self):
+        from assembly.main import _build_parser
+
+        return _build_parser()
+
+    def test_serve_refuses_to_run_without_an_archive(self):
+        with pytest.raises(SystemExit) as exc:
+            self._parser().parse_args(["serve"])
+        assert exc.value.code == 2, "argparse should reject the missing -m"
+
+    @pytest.mark.parametrize("command", ["serve", "info"])
+    def test_every_archive_command_requires_m(self, command):
+        """serve and info can only ever mean a path, so argparse demands it."""
+        with pytest.raises(SystemExit) as exc:
+            self._parser().parse_args([command])
+        assert exc.value.code == 2, command
+
+    def test_run_keeps_m_optional_for_the_server_alias_form(self):
+        """`run -s URL -m default` names an alias, not a file.
+
+        So -m cannot be argparse-required on run; it is required only on the
+        local-inference path, which _require_model_argument enforces.
+        """
+        args = self._parser().parse_args(
+            ["run", "-s", "http://localhost:8000", "-m", "default", "-p", "hi"]
+        )
+        assert args.model == "default"
+        assert args.server == "http://localhost:8000"
+
+    @pytest.mark.parametrize("command", ["serve", "run", "info"])
+    def test_a_relative_path_is_refused(self, command, tmp_path, capsys,
+                                        monkeypatch):
+        from assembly.main import _require_archive
+
+        # resolve() spells out the fix against the cwd, so pin it.
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            _require_archive("a.asmb")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "must be absolute" in err
+        # The error has to hand back the path that would have worked.
+        assert str(tmp_path / "a.asmb") in err, "the fix was not spelled out"
+
+    def test_an_absolute_path_is_accepted(self, tmp_path):
+        from assembly.main import _require_archive
+
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        assert _require_archive(str(archive)) == str(archive)
+
+    def test_a_tilde_path_is_expanded(self, tmp_path, monkeypatch):
+        """`~` is a shell nicety, but expanduser covers the quoted case too."""
+        from assembly.main import _require_archive
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / "a.asmb").write_bytes(b"x")
+        assert _require_archive("~/a.asmb") == str(tmp_path / "a.asmb")
+
+    def test_a_missing_absolute_path_still_reports_not_found(self, capsys):
+        from assembly.main import _require_archive
+
+        with pytest.raises(SystemExit) as exc:
+            _require_archive("/nonexistent/nope.asmb")
+        assert exc.value.code == 1
+        assert "no such archive" in capsys.readouterr().err
+
+    def test_the_error_names_the_command_they_ran(self, capsys, tmp_path):
+        from assembly.main import _require_model_argument
+
+        with pytest.raises(SystemExit):
+            _require_model_argument(
+                argparse.Namespace(command="run", model=None)
+            )
+        assert "assembly run -m" in capsys.readouterr().err
+
+    def test_auto_detection_is_gone(self):
+        """The cwd-dependent guess is what this rule replaces."""
+        from assembly import main as main_mod
+
+        assert not hasattr(main_mod, "_auto_detect_model")
+
+
 class TestCLI:
     """Argument wiring, --version, and exit codes."""
 
@@ -1127,14 +1324,15 @@ class TestCLI:
         assert __version__ in capsys.readouterr().out
 
     def test_serve_defaults_to_loopback(self):
-        args = self._parser().parse_args(["serve"])
+        args = self._parser().parse_args(["serve", "-m", "/models/a.asmb"])
         assert args.host == "127.0.0.1"
         assert args.api_key is None
         assert args.allow_origin is None
 
     def test_serve_security_flags_parse(self):
         args = self._parser().parse_args(
-            ["serve", "--host", "0.0.0.0", "--api-key", "s3cret",
+            ["serve", "-m", "/models/a.asmb",
+             "--host", "0.0.0.0", "--api-key", "s3cret",
              "--allow-origin", "http://localhost:5173",
              "--models-dir", "/tmp/models", "--temp-dir", "/tmp/stage"]
         )
@@ -1148,9 +1346,18 @@ class TestCLI:
         assert args.prompt_pos == "hello there"
         assert args.prompt is None
 
-    def test_run_keeps_temp_dir_flag(self):
-        args = self._parser().parse_args(["run", "-m", "x.asmb", "--temp-dir", "/s"])
-        assert str(args.temp_dir) == "/s"
+    def test_run_no_longer_offers_local_only_flags(self):
+        """--temp-dir/--n-gpu-layers/-v only configured the deleted local model.
+
+        Left in place they would parse and then silently do nothing, which is
+        worse than refusing: someone would point staging at a fast volume and
+        watch it be ignored.
+        """
+        for flag, value in (("--temp-dir", "/s"), ("--n-gpu-layers", "4"), ("-v", None)):
+            argv = ["run", "-m", "/m/a.asmb", flag] + ([value] if value else [])
+            with pytest.raises(SystemExit) as exc:
+                self._parser().parse_args(argv)
+            assert exc.value.code == 2, flag
 
     def test_serve_refuses_public_host_without_key(self, monkeypatch):
         from assembly import server
@@ -1212,7 +1419,7 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc:
             _cmd_info(args)
         assert exc.value.code == 1
-        assert "No such archive" in capsys.readouterr().err
+        assert "no such archive" in capsys.readouterr().err
 
     def test_info_rejects_corrupt_archive(self, tmp_path, capsys):
         from assembly.main import _cmd_info
@@ -1223,7 +1430,7 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc:
             _cmd_info(argparse.Namespace(model=str(bad)))
         assert exc.value.code == 1
-        assert "No such archive" not in capsys.readouterr().err
+        assert "no such archive" not in capsys.readouterr().err
 
     def test_build_surfaces_build_error(self, tmp_path, capsys, monkeypatch):
         from assembly import packer
@@ -2306,7 +2513,7 @@ class TestContextResolution:
         from assembly.main import _build_parser
 
         parser = _build_parser()
-        for argv in (["serve"], ["run"]):
+        for argv in (["serve", "-m", "/m/a.asmb"], ["run", "-m", "/m/a.asmb"]):
             args = parser.parse_args(argv)
             assert not hasattr(args, "n_ctx"), argv
 
@@ -2315,7 +2522,7 @@ class TestContextResolution:
 
         parser = _build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["serve", "--n-ctx", "4096"])
+            parser.parse_args(["serve", "-m", "/m/a.asmb", "--n-ctx", "4096"])
 
 
 class TestConversationSummarization:
@@ -3067,3 +3274,1977 @@ class TestHeaderStrictness:
 
         with pytest.raises(InvalidArchiveError, match="past the end"):
             read_header(bytes(pre) + doc)
+
+
+# ── Windows compatibility ────────────────────────────────────────────
+
+class _FakeWin32Fn:
+    """A callable that accepts the restype/argtypes the real ctypes call sets."""
+
+    def __init__(self, impl):
+        self._impl = impl
+        self.restype = "UNSET"
+        self.argtypes = "UNSET"
+
+    def __call__(self, *args):
+        return self._impl(*args)
+
+
+class _FakeKernel32:
+    """Stands in for kernel32 so the Windows probe's logic is testable anywhere.
+
+    ``ctypes.WinDLL`` does not exist off Windows, so the probe cannot even be
+    called on a POSIX runner. Substituting the DLL exercises the branch logic
+    and the handle bookkeeping; the real API is covered by
+    test_the_win32_probe_works_against_a_real_process and by the CI job.
+    """
+
+    def __init__(self, handle, exit_code, get_fails=False):
+        self.handle = handle
+        self.exit_code = exit_code
+        self.get_fails = get_fails
+        self.closed = []
+        self.OpenProcess = _FakeWin32Fn(self._open)
+        self.GetExitCodeProcess = _FakeWin32Fn(self._exit_code)
+        self.CloseHandle = _FakeWin32Fn(self._close)
+
+    def _open(self, access, inherit, pid):
+        assert access == 0x1000, f"unexpected access mask {access}"
+        return self.handle
+
+    def _exit_code(self, handle, out):
+        import ctypes as _ctypes
+
+        if self.get_fails:
+            return 0
+        _ctypes.cast(out, _ctypes.POINTER(_ctypes.c_uint32))[0] = self.exit_code
+        return 1
+
+    def _close(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
+@pytest.fixture
+def probe_on_this_platform(monkeypatch):
+    """Call the Windows probe here, with a fake kernel32 and a chosen result."""
+    import ctypes as _ctypes
+
+    from assembly import packer
+
+    def call(*, handle=0x1234, exit_code=259, get_fails=False, last_error=0):
+        kernel32 = _FakeKernel32(handle, exit_code, get_fails)
+        # The probe calls ctypes.WinDLL / ctypes.get_last_error inside the
+        # function body, so patching the module reaches it.
+        monkeypatch.setattr(
+            _ctypes, "WinDLL", lambda *a, **k: kernel32, raising=False
+        )
+        monkeypatch.setattr(_ctypes, "get_last_error", lambda: last_error,
+                            raising=False)
+        return packer._pid_exists_windows(4242), kernel32
+
+    return call
+
+
+class TestWindowsProbeLogic:
+    """Branches of the Windows liveness probe, decided by the exit code."""
+
+    def test_a_running_process_is_alive(self, probe_on_this_platform):
+        # STILL_ACTIVE is 259; that is what a live process reports.
+        assert probe_on_this_platform(exit_code=259)[0] is True
+
+    def test_an_exited_process_is_not_alive(self, probe_on_this_platform):
+        assert probe_on_this_platform(exit_code=0)[0] is False
+
+    def test_a_nonstandard_exit_code_is_not_alive(self, probe_on_this_platform):
+        assert probe_on_this_platform(exit_code=1)[0] is False
+
+    def test_a_refused_open_is_treated_as_alive(self, probe_on_this_platform):
+        """ERROR_ACCESS_DENIED: the process exists, we just cannot query it.
+
+        Erring the other way would delete a live build's partial, which is the
+        one outcome that loses data; keeping a stale file only wastes disk.
+        """
+        alive, _ = probe_on_this_platform(handle=0, last_error=5)
+        assert alive is True
+
+    def test_a_failed_open_is_treated_as_dead(self, probe_on_this_platform):
+        # ERROR_INVALID_PARAMETER / anything else: no such process.
+        assert probe_on_this_platform(handle=0, last_error=87)[0] is False
+
+    def test_an_unreadable_exit_code_is_treated_as_alive(self, probe_on_this_platform):
+        """The handle opened, so the process exists. Default to keeping it."""
+        alive, _ = probe_on_this_platform(get_fails=True)
+        assert alive is True
+
+    def test_the_handle_is_closed_on_every_path(self, probe_on_this_platform):
+        _, kernel32 = probe_on_this_platform()
+        assert kernel32.closed == [0x1234], "probe leaked a process handle"
+
+    def test_the_handle_is_closed_when_the_read_fails(self, probe_on_this_platform):
+        """A failed GetExitCodeProcess must still not leak; it is in a finally."""
+        _, kernel32 = probe_on_this_platform(get_fails=True)
+        assert kernel32.closed == [0x1234]
+
+    def test_the_ffi_signatures_are_actually_set(self, probe_on_this_platform):
+        """ctypes defaults returns to c_int, truncating a 64-bit HANDLE.
+
+        A truncated handle reads as a small integer and is mistaken for
+        failure, which is indistinguishable from "this build is dead" -- and
+        gets a live build's partial deleted.
+        """
+        _, kernel32 = probe_on_this_platform()
+        for fn in (kernel32.OpenProcess, kernel32.GetExitCodeProcess,
+                   kernel32.CloseHandle):
+            assert fn.restype != "UNSET", f"{fn.__name__} restype not declared"
+            assert fn.argtypes != "UNSET", f"{fn.__name__} argtypes not declared"
+
+
+class TestWindowsProcessProbe:
+    """``_writer_alive`` decides whether a partial file is safe to delete.
+
+    On POSIX that is ``os.kill(pid, 0)``, which signals nothing. On Windows
+    CPython routes every signal except CTRL_C_EVENT / CTRL_BREAK_EVENT through
+    TerminateProcess, so the obvious implementation would kill the very build
+    it is meant to protect and then delete its partial out from under it.
+    """
+
+    def test_dispatch_follows_the_platform(self, monkeypatch):
+        from assembly import packer
+
+        calls = []
+        monkeypatch.setattr(packer, "_pid_exists_posix",
+                            lambda pid: calls.append(("posix", pid)) or True)
+        monkeypatch.setattr(packer, "_pid_exists_windows",
+                            lambda pid: calls.append(("nt", pid)) or False)
+
+        monkeypatch.setattr(packer, "IS_WINDOWS", False)
+        assert packer._writer_alive(123) is True
+        monkeypatch.setattr(packer, "IS_WINDOWS", True)
+        assert packer._writer_alive(123) is False
+
+        assert calls == [("posix", 123), ("nt", 123)]
+
+    def test_the_win32_probe_never_signals_the_process(self):
+        """The probe must be observational. Any signalling call is a bug.
+
+        This is the failure that matters on Windows: os.kill(pid, 0) looks
+        like a harmless existence check, but CPython forwards it to
+        TerminateProcess, so it kills the running build and then the sweep
+        deletes its partial. Asserted structurally so it cannot regress
+        quietly on a platform where the mistake is invisible.
+        """
+        import ast
+        import inspect as _inspect
+        import textwrap
+
+        from assembly import packer
+
+        # Parsed rather than grepped: the prohibition is explained in the
+        # docstring, so a text search would flag its own explanation. What
+        # matters is whether the function *calls* anything that signals.
+        tree = ast.parse(textwrap.dedent(_inspect.getsource(
+            packer._pid_exists_windows)))
+        called = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute):
+                    called.add(func.attr)
+                elif isinstance(func, ast.Name):
+                    called.add(func.id)
+
+        assert "kill" not in called, f"the probe signals a process: {called}"
+        assert "system" not in called
+        # The supported way to ask, with no side effect on the target.
+        assert "OpenProcess" in called
+        assert "GetExitCodeProcess" in called
+
+    def test_the_win32_probe_closes_its_handle(self):
+        """Every OpenProcess must be matched by a CloseHandle.
+
+        Left open, each probe leaks a handle, and a long sweep over stale
+        partials would eventually exhaust the per-process handle limit.
+        """
+        import inspect as _inspect
+
+        from assembly import packer
+
+        source = _inspect.getsource(packer._pid_exists_windows)
+        assert source.count("OpenProcess") >= 1
+        assert source.count("CloseHandle") >= 1
+        assert "finally" in source
+
+    def test_the_win32_probe_works_against_a_real_process(self):
+        """Exercise the Windows probe against a real process where possible.
+
+        The concern is not theoretical: OpenProcess/GetExitCodeProcess on a
+        process that is still running must report it alive, and must report a
+        reaped one dead. On a POSIX runner this is skipped rather than faked,
+        because a monkeypatched kernel32 proves nothing about the real API.
+        """
+        import subprocess as _subprocess
+        import sys as _sys
+
+        from assembly import packer
+
+        if not packer.IS_WINDOWS:
+            pytest.skip("the Windows probe is a no-op on this platform")
+
+        # A child that outlives the assertion, so "alive" is unambiguous.
+        child = _subprocess.Popen(
+            [_sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        try:
+            assert packer._writer_alive(child.pid) is True
+            # Reap it, then the PID is free and the probe must say dead.
+            child.terminate()
+            child.wait(timeout=30)
+            assert packer._writer_alive(child.pid) is False
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=30)
+
+    def test_the_posix_probe_never_signals_either(self):
+        """The POSIX probe uses signal 0, which is a genuine no-op."""
+        import ast
+        import inspect as _inspect
+        import textwrap
+
+        from assembly import packer
+
+        tree = ast.parse(textwrap.dedent(_inspect.getsource(
+            packer._pid_exists_posix)))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "kill"
+        ]
+        assert len(calls) == 1
+        # Signal 0 is the whole trick: any other signal would actually signal.
+        assert calls[0].args[1].value == 0
+
+    def test_the_win32_probe_declares_its_handle_types(self):
+        """An un-annotated HANDLE is truncated to c_int on 64-bit Windows.
+
+        ctypes defaults every return value to c_int, so without restype and
+        argtypes a real handle can arrive looking like a small integer and be
+        read as failure -- which would look like 'this build is dead' and get a
+        live build's partial deleted.
+        """
+        import inspect as _inspect
+
+        from assembly import packer
+
+        source = _inspect.getsource(packer._pid_exists_windows)
+        assert "restype" in source
+        assert "argtypes" in source
+
+    def test_the_platform_flag_is_not_patched_globally(self):
+        """pathlib.Path picks its flavour from os.name, so it must stay put.
+
+        Reading the platform from a module constant rather than mutating os
+        keeps a Windows test run from turning every Path into a WindowsPath
+        on Linux.
+        """
+        import os as _os
+
+        from assembly import packer
+
+        before = _os.name
+        packer.IS_WINDOWS = not packer.IS_WINDOWS
+        assert _os.name == before
+
+    def test_posix_probe_reports_missing_pid(self):
+        from assembly.packer import _pid_exists_posix
+
+        # Pid 0 addresses a process group, so use a pid that cannot be running.
+        # 2^22 is above Linux's default pid_max and above Windows' practical
+        # range, so this is reliably not a live process on the POSIX path.
+        assert _pid_exists_posix(1 << 22) is False
+
+    def test_posix_probe_reports_live_pid(self):
+        import os as _os
+
+        from assembly.packer import _pid_exists_posix
+
+        assert _pid_exists_posix(_os.getpid()) is True
+
+    def test_posix_probe_treats_permission_error_as_alive(self, monkeypatch):
+        """A pid we may not signal still exists; deleting its file is the risk."""
+        from assembly import packer
+
+        def denied(pid, sig):
+            raise PermissionError
+
+        monkeypatch.setattr(packer.os, "kill", denied)
+        assert packer._pid_exists_posix(4242) is True
+
+    def test_posix_probe_treats_lookup_error_as_dead(self, monkeypatch):
+        from assembly import packer
+
+        def missing(pid, sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(packer.os, "kill", missing)
+        assert packer._pid_exists_posix(4242) is False
+
+
+class TestWindowsStaging:
+    """Blob staging on platforms without memfd, which is every Windows build.
+
+    Windows holds an open handle exclusive enough that a still-open staging
+    file cannot be opened by name, so a file that is written and only closed
+    later would fail inside llama.cpp with a sharing violation rather than at
+    the point of the mistake.
+    """
+
+    def _force_file_staging(self, monkeypatch):
+        """Pretend we are on Windows even when the tests run on Linux."""
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper.sys, "platform", "win32")
+        monkeypatch.delattr(wrapper.os, "memfd_create", raising=False)
+
+    def test_staged_file_is_closed_before_its_path_is_handed_over(
+        self, tmp_path, monkeypatch
+    ):
+        """The path must be openable by another process, not just readable here."""
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+        with wrapper._memfd_model("m.gguf", b"payload") as path:
+            # An independent open is the actual requirement. On Windows this
+            # raises PermissionError if our handle is still open; on Linux it
+            # succeeds either way, which is why the same test runs everywhere.
+            with open(path, "rb") as probe:
+                assert probe.read() == b"payload"
+
+    def test_staged_file_is_removed_on_exit(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+        with wrapper._memfd_model("m.gguf", b"payload") as path:
+            assert pathlib.Path(path).is_file()
+
+        assert not pathlib.Path(path).exists()
+
+    def test_staged_blob_is_named_so_llama_cpp_recognises_it(
+        self, tmp_path, monkeypatch
+    ):
+        """llama.cpp dispatches on the .gguf extension."""
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+        with wrapper._memfd_model("router.gguf", b"x") as path:
+            assert path.endswith(".gguf")
+
+    def test_cleanup_tolerates_a_locked_blob(self, tmp_path, monkeypatch):
+        """Windows keeps a mapped file locked; losing the race is not an error.
+
+        llama.cpp holds the model mapping for the lifetime of the model, not
+        just the load, so on Windows the unlink at the end of staging usually
+        fails. Raising there would turn a successful load into a crash, and the
+        space is reclaimed when the staging directory goes at exit instead.
+        """
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+        def locked_unlink(self, missing_ok=False):
+            raise PermissionError(13, "used by another process")
+
+        monkeypatch.setattr(pathlib.Path, "unlink", locked_unlink)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+        wrapper._unstage_blob(path)  # must not raise
+
+    def test_a_failed_write_leaves_no_partial_blob(self, tmp_path, monkeypatch):
+        """A truncated blob would surface as a bogus llama.cpp load error."""
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+        boom = RuntimeError("disk fell over")
+
+        def exploding_write(target, data):
+            raise boom
+
+        monkeypatch.setattr(wrapper, "_write_blob", exploding_write)
+
+        with pytest.raises(RuntimeError, match="disk fell over"):
+            wrapper._stage_blob("m.gguf", b"payload" * 1000)
+
+        assert list(tmp_path.iterdir()) == [], "a partial blob survived"
+
+    def test_space_is_checked_before_writing(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        monkeypatch.setattr(wrapper, "free_bytes_at", lambda _d: 1)
+
+        with pytest.raises(wrapper.StagingError, match="not enough space"):
+            wrapper._stage_blob("big.gguf", b"\x00" * 4096)
+
+    def test_untouchable_staging_dir_is_a_readable_error(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+        def refused(*args, **kwargs):
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(wrapper.tempfile, "mkstemp", refused)
+
+        with pytest.raises(wrapper.StagingError, match="could not create a staging file"):
+            wrapper._stage_blob("m.gguf", b"x")
+
+
+class TestStagingDirOwnership:
+    """A user's --temp-dir is theirs, and must never be deleted for them."""
+
+    def _reset(self):
+        from assembly import wrapper
+
+        wrapper._TEMP_DIR = None
+        wrapper._TEMP_DIR_OWNED = False
+
+    def test_configured_dir_is_never_removed(self, tmp_path):
+        from assembly import wrapper
+
+        self._reset()
+        try:
+            mine = tmp_path / "mine"
+            keep = mine / "important.txt"
+            wrapper.configure_temp_dir(mine)
+            keep.write_text("do not delete me")
+
+            wrapper.cleanup_temp_dir()
+
+            assert keep.is_file(), "cleanup deleted a file from a user temp dir"
+            assert wrapper._TEMP_DIR is not None, "cleanup forgot the directory"
+        finally:
+            self._reset()
+
+    def test_our_own_dir_is_removed(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._reset()
+        monkeypatch.setenv(wrapper.TEMP_DIR_ENV, str(tmp_path / "base"))
+        try:
+            created = wrapper.assembly_temp_dir()
+            assert created.is_dir()
+
+            wrapper.cleanup_temp_dir()
+
+            assert not created.exists(), "our own staging dir was left behind"
+            assert wrapper.assembly_temp_dir() != created, "not recreated after cleanup"
+        finally:
+            self._reset()
+
+    def test_repointing_does_not_delete_the_users_directory(self, tmp_path):
+        """Switching dirs must not rmtree whatever the user gave us first."""
+        from assembly import wrapper
+
+        self._reset()
+        try:
+            first = tmp_path / "first"
+            keeper = first / "keep.txt"
+            wrapper.configure_temp_dir(first)
+            keeper.write_text("still here")
+
+            wrapper.configure_temp_dir(tmp_path / "second")
+
+            assert keeper.is_file(), "repointing deleted the user's directory"
+        finally:
+            self._reset()
+
+    def test_repointing_does_remove_our_own_previous_dir(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._reset()
+        monkeypatch.setenv(wrapper.TEMP_DIR_ENV, str(tmp_path / "base"))
+        try:
+            created = wrapper.assembly_temp_dir()
+            assert created.is_dir()
+
+            wrapper.configure_temp_dir(tmp_path / "second")
+
+            assert not created.exists(), "our own abandoned staging dir leaked"
+        finally:
+            self._reset()
+
+    def test_cleanup_is_idempotent(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._reset()
+        monkeypatch.setenv(wrapper.TEMP_DIR_ENV, str(tmp_path / "base"))
+        try:
+            wrapper.assembly_temp_dir()
+            wrapper.cleanup_temp_dir()
+            wrapper.cleanup_temp_dir()  # must not raise
+        finally:
+            self._reset()
+
+
+class TestWindowsConsolePrompt:
+    """The REPL prompt bypasses rich and goes straight through input().
+
+    On a legacy Windows console there is nothing to interpret an ANSI colour
+    sequence, so the raw bytes are printed and the user types after a string of
+    escape codes.
+    """
+
+    def test_no_escapes_on_a_legacy_console(self, monkeypatch):
+        from assembly import ui
+
+        monkeypatch.setattr(ui, "_LEGACY_WINDOWS_CONSOLE", True)
+        assert ui.prompt_text() == "▸ "
+        assert "\x1b" not in ui.prompt_text()
+
+    def test_no_escapes_when_no_color(self, monkeypatch):
+        from assembly import ui
+
+        monkeypatch.setattr(ui, "_NO_COLOR", True)
+        assert "\x1b" not in ui.prompt_text()
+
+    def test_colour_is_kept_on_a_capable_terminal(self, monkeypatch):
+        from assembly import ui
+
+        monkeypatch.setattr(ui, "_NO_COLOR", False)
+        monkeypatch.setattr(ui, "_DUMB", False)
+        monkeypatch.setattr(ui, "_LEGACY_WINDOWS_CONSOLE", False)
+        monkeypatch.setattr(ui.sys.stdout, "isatty", lambda: True)
+        assert "\x1b" in ui.prompt_text()
+
+    def test_no_escapes_when_stdout_is_redirected(self, monkeypatch):
+        """input() writes the prompt to stdout itself, escape codes and all.
+
+        So a piped or captured session would otherwise get raw sequences in
+        the middle of its transcript.
+        """
+        from assembly import ui
+
+        monkeypatch.setattr(ui, "_NO_COLOR", False)
+        monkeypatch.setattr(ui, "_DUMB", False)
+        monkeypatch.setattr(ui, "_LEGACY_WINDOWS_CONSOLE", False)
+        monkeypatch.setattr(ui.sys.stdout, "isatty", lambda: False)
+        assert ui.prompt_text() == "▸ "
+
+    def test_no_escapes_on_a_dumb_terminal(self, monkeypatch):
+        """TERM=dumb: a terminal that exists but cannot render colour."""
+        from assembly import ui
+
+        monkeypatch.setattr(ui, "_NO_COLOR", False)
+        monkeypatch.setattr(ui, "_DUMB", True)
+        monkeypatch.setattr(ui, "_LEGACY_WINDOWS_CONSOLE", False)
+        monkeypatch.setattr(ui.sys.stdout, "isatty", lambda: True)
+        assert ui.prompt_text() == "▸ "
+
+
+class TestBuildSignalHandling:
+    """A build must clean up its partial on interruption without trapping the user.
+
+    The handler raises rather than ignoring, so Ctrl-C still cancels a long
+    build; a second signal escalates to the platform default so a stuck unwind
+    cannot make the build unstoppable.
+    """
+
+    def test_handlers_are_installed_and_restored(self):
+        import signal as _signal
+
+        from assembly import packer
+
+        before = _signal.getsignal(_signal.SIGINT)
+        previous = packer._install_build_signal_handlers()
+        try:
+            installed = _signal.getsignal(_signal.SIGINT)
+            assert installed is not _signal.SIG_IGN, "SIGINT was swallowed"
+            assert isinstance(installed, packer._BuildSignalHandler)
+        finally:
+            packer._restore_signal_handlers(previous)
+
+        assert _signal.getsignal(_signal.SIGINT) == before
+
+    def test_ctrl_c_actually_cancels_a_build(self):
+        """Regression: SIG_IGN would make a 20-minute build uncancellable.
+
+        CPython does not raise KeyboardInterrupt for a signal whose handler is
+        SIG_IGN, so "ignore SIGINT and let the first Ctrl-C through" is not a
+        thing that can be true. The handler has to raise it itself.
+        """
+        import signal as _signal
+
+        from assembly import packer
+
+        previous = packer._install_build_signal_handlers()
+        try:
+            handler = _signal.getsignal(_signal.SIGINT)
+            with pytest.raises(KeyboardInterrupt, match="SIGINT"):
+                handler(_signal.SIGINT, None)
+        finally:
+            packer._restore_signal_handlers(previous)
+
+    def test_sigterm_also_unwinds_instead_of_killing(self):
+        """`kill` must reach the same cleanup as Ctrl-C."""
+        import signal as _signal
+
+        from assembly import packer
+
+        if not hasattr(_signal, "SIGTERM"):
+            pytest.skip("SIGTERM is Unix-only")
+
+        previous = packer._install_build_signal_handlers()
+        try:
+            handler = _signal.getsignal(_signal.SIGTERM)
+            with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+                handler(_signal.SIGTERM, None)
+        finally:
+            packer._restore_signal_handlers(previous)
+
+    def test_a_second_signal_escalates_instead_of_looping(self):
+        """The first signal unwinds; the second gives up on the unwind.
+
+        Without escalation, a cleanup stuck unlinking a multi-gigabyte partial
+        would need an unbounded number of Ctrl-C presses to escape.
+        """
+        from assembly import packer
+
+        handler = packer._BuildSignalHandler(2, {2: None})
+        with pytest.raises(KeyboardInterrupt):
+            handler(2, None)          # first signal: the ordinary unwind
+        assert handler._seen is True
+
+        # The second call must escalate instead of raising again. Escalation
+        # terminates the process, so stand in for it.
+        escalated = []
+        handler._escalate = lambda: escalated.append(True)
+        with pytest.raises(KeyboardInterrupt):
+            handler(2, None)          # raised after the stubbed escalation
+        assert escalated == [True]
+
+    def test_restore_survives_a_platform_without_the_signal(self):
+        """SIGHUP does not exist on Windows; restoring must not raise."""
+        from assembly import packer
+
+        packer._restore_signal_handlers({9999: None})
+
+    def test_build_restores_handlers_even_when_it_fails(self, tmp_path):
+        """A failed build must not leave our handler installed for the process."""
+        import signal as _signal
+
+        from assembly import packer
+
+        before = _signal.getsignal(_signal.SIGINT)
+
+        with pytest.raises(Exception):
+            packer.build(str(tmp_path / "does-not-exist.json"),
+                         tmp_path / "out.asmb")
+
+        assert _signal.getsignal(_signal.SIGINT) == before
+
+    def test_a_successful_build_restores_handlers(self, tmp_path):
+        import signal as _signal
+
+        from assembly.packer import build
+        from tests.test_assembly import TestPackerIntegrity
+
+        before = _signal.getsignal(_signal.SIGINT)
+        builder = TestPackerIntegrity()
+        cfg_path = builder._config(tmp_path)
+
+        build(cfg_path, tmp_path / "built.asmb", skip_embeddings=True)
+
+        assert _signal.getsignal(_signal.SIGINT) == before
+
+    def test_no_handler_is_left_behind_after_a_successful_build(self, tmp_path):
+        """Regression: a lingering handler breaks Ctrl-C for the rest of the run."""
+        import signal as _signal
+
+        from assembly.packer import build
+        from tests.test_assembly import TestPackerIntegrity
+
+        before = _signal.getsignal(_signal.SIGINT)
+        builder = TestPackerIntegrity()
+        cfg_path = builder._config(tmp_path)
+
+        build(cfg_path, tmp_path / "built.asmb", skip_embeddings=True)
+
+        from assembly import packer
+
+        left = _signal.getsignal(_signal.SIGINT)
+        assert not isinstance(left, packer._BuildSignalHandler)
+        assert left == before
+
+class TestBuildOnWindowsPaths:
+    """Build mechanics that differ because Windows locks files it opens."""
+
+    def test_fsync_dir_is_a_noop_on_windows(self, tmp_path, monkeypatch):
+        from assembly import packer
+
+        monkeypatch.setattr(packer, "IS_WINDOWS", True)
+        opened = []
+        monkeypatch.setattr(packer.os, "open",
+                            lambda *a, **k: opened.append(a) or 3)
+
+        packer._fsync_dir(tmp_path)  # must not raise, must not open anything
+        assert opened == []
+
+    def test_fsync_dir_tolerates_a_filesystem_that_refuses(self, tmp_path):
+        from assembly import packer
+
+        packer._fsync_dir(tmp_path)  # a real directory on a real filesystem
+
+    def test_a_locked_output_is_reported_in_the_users_terms(self, tmp_path,
+                                                             monkeypatch):
+        """Windows will not replace a file another process has open.
+
+        That is what happens when `assembly serve` holds the archive mapped, so
+        the error has to say so; "Permission denied" after an hour of packing
+        tells the user nothing.
+        """
+        from assembly import packer
+        from tests.test_assembly import TestPackerIntegrity
+
+        builder = TestPackerIntegrity()
+        cfg_path = builder._config(tmp_path)
+
+        def locked_replace(*args, **kwargs):
+            raise PermissionError(13, "The process cannot access the file")
+
+        monkeypatch.setattr(packer.os, "replace", locked_replace)
+
+        with pytest.raises(packer.BuildError, match="in use by another program"):
+            packer.build(cfg_path, tmp_path / "built.asmb", skip_embeddings=True)
+
+    def test_the_partial_is_reclaimed_after_a_locked_output(self, tmp_path,
+                                                            monkeypatch):
+        """The renamed-away partial must still be swept on the next build."""
+        from assembly import packer
+        from tests.test_assembly import TestPackerIntegrity
+
+        builder = TestPackerIntegrity()
+        cfg_path = builder._config(tmp_path)
+
+        def locked_replace(*args, **kwargs):
+            raise PermissionError(13, "in use")
+
+        monkeypatch.setattr(packer.os, "replace", locked_replace)
+
+        with pytest.raises(packer.BuildError):
+            packer.build(cfg_path, tmp_path / "built.asmb", skip_embeddings=True)
+
+        monkeypatch.undo()
+        assert not (tmp_path / "built.asmb").exists()
+        packer.build(cfg_path, tmp_path / "built.asmb", skip_embeddings=True)
+        assert (tmp_path / "built.asmb").is_file()
+
+
+class TestStagedBlobNaming:
+    """A staged blob's filename must be derived from ours, not the model's.
+
+    Windows reserves a set of device names -- CON, PRN, AUX, NUL, COM1..9,
+    LPT1..9 -- that cannot be used as filenames at all. A model is named
+    freely in the config, so staging must never take that name as the path; a
+    model called "nul" has to work.
+    """
+
+    def _force_file_staging(self, monkeypatch, tmp_path):
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper.sys, "platform", "win32")
+        monkeypatch.delattr(wrapper.os, "memfd_create", raising=False)
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+
+    @pytest.mark.parametrize(
+        "model_name",
+        ["nul", "CON", "prn", "aux", "COM1", "lpt9", "clock$"],
+    )
+    def test_reserved_device_names_stage_normally(self, tmp_path, monkeypatch,
+                                                 model_name):
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch, tmp_path)
+
+        with wrapper._memfd_model(model_name, b"payload") as path:
+            # The path must be usable as a real file, which on Windows is the
+            # whole question: `nul.gguf` would be the null device, not a file.
+            assert pathlib.Path(path).is_file()
+            assert pathlib.Path(path).read_bytes() == b"payload"
+
+    def test_the_staged_name_does_not_come_from_the_model(self, tmp_path,
+                                                          monkeypatch):
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch, tmp_path)
+
+        with wrapper._memfd_model("nul", b"payload") as path:
+            assert pathlib.Path(path).name != "nul.gguf"
+
+    def test_a_hostile_model_name_cannot_escape_the_staging_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """Separators and dot segments must not steer the write elsewhere."""
+        from assembly import wrapper
+
+        self._force_file_staging(monkeypatch, tmp_path)
+
+        with wrapper._memfd_model("../../escaped", b"payload") as path:
+            assert pathlib.Path(path).parent == tmp_path
+
+    def test_paths_with_spaces_still_stage(self, tmp_path, monkeypatch):
+        """Windows paths with spaces are ordinary; nothing may quote-split them."""
+        from assembly import wrapper
+
+        spaced = tmp_path / "a dir with spaces"
+        spaced.mkdir()
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: spaced)
+
+        with wrapper._memfd_model("m.gguf", b"payload") as path:
+            assert pathlib.Path(path).read_bytes() == b"payload"
+            assert " " in path
+
+
+class TestLockedBlobCleanup:
+    """A blob that cannot be deleted at unload time must still leave no litter.
+
+    Windows keeps a mapped file locked for as long as the mapping lives, and
+    llama.cpp holds the model mapping until the model is dropped. The immediate
+    unlink therefore cannot be unconditional. The tempting fallback — delete the
+    staging directory — is wrong whenever the directory is the user's, so the
+    path itself is remembered and retried at exit instead.
+    """
+
+    @staticmethod
+    def _make_unlink_fail(monkeypatch):
+        import pathlib as _pathlib
+
+        monkeypatch.setattr(
+            _pathlib.Path, "unlink",
+            lambda self, **kw: (_ for _ in ()).throw(
+                PermissionError(13, "file is in use by another process")
+            ),
+        )
+
+    def test_a_locked_blob_is_remembered_for_exit(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+
+        self._make_unlink_fail(monkeypatch)
+        wrapper._unstage_blob(path)
+
+        assert path in wrapper._PENDING_UNLINK, (
+            "a blob that could not be deleted must be retried at exit"
+        )
+
+    def test_the_retry_removes_it_once_the_mapping_is_gone(self, tmp_path,
+                                                          monkeypatch):
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+
+        self._make_unlink_fail(monkeypatch)
+        wrapper._unstage_blob(path)
+        assert path.exists()
+
+        # The llama.cpp object is gone, so the file is no longer held open.
+        monkeypatch.undo()
+        wrapper._flush_pending_unlinks()
+
+        assert not path.exists()
+        assert path not in wrapper._PENDING_UNLINK
+
+    def test_a_successful_unlink_is_not_remembered(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+        wrapper._unstage_blob(path)
+
+        assert not path.exists()
+        assert path not in wrapper._PENDING_UNLINK
+
+    def test_the_retry_is_safe_when_the_file_is_already_gone(self, tmp_path,
+                                                             monkeypatch):
+        """Missing file is success, not an error worth retrying."""
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+        wrapper._defer_unlink(path)
+        path.unlink()
+
+        wrapper._flush_pending_unlinks()
+
+        assert path not in wrapper._PENDING_UNLINK
+
+    def test_a_permanently_locked_blob_does_not_spin_forever(self, tmp_path,
+                                                             monkeypatch):
+        """Give up rather than looping on a file that will never unlock."""
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+        wrapper._defer_unlink(path)
+
+        self._make_unlink_fail(monkeypatch)
+        wrapper._flush_pending_unlinks()  # must return, not hang
+
+    def test_a_users_staging_directory_keeps_their_own_files(self, tmp_path,
+                                                              monkeypatch):
+        """The retry removes our blob and nothing else.
+
+        This is the case that rules out "just delete the directory at exit" as
+        the fallback: the directory holds files the user put there.
+        """
+        from assembly import wrapper
+
+        theirs = tmp_path / "someone-elses-model.gguf"
+        theirs.write_bytes(b"not ours")
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        monkeypatch.setattr(wrapper, "_TEMP_DIR", tmp_path, raising=False)
+        monkeypatch.setattr(wrapper, "_TEMP_DIR_OWNED", False, raising=False)
+        path = wrapper._stage_blob("m.gguf", b"payload")
+
+        self._make_unlink_fail(monkeypatch)
+        wrapper._unstage_blob(path)
+        monkeypatch.undo()
+
+        wrapper.cleanup_temp_dir()  # must not touch a directory we do not own
+        wrapper._flush_pending_unlinks()
+
+        assert not path.exists()
+        assert theirs.is_file(), "cleanup removed a file it did not create"
+        assert theirs.read_bytes() == b"not ours"
+
+
+class TestServerBearerAuth:
+    """The bearer token must not be crashable, and failures must be visible.
+
+    Every one of these was found by sending the request a real client could
+    send, not by reading the code.
+    """
+
+    def _handler(self, api_key: str, request: bytes):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        sock = MockSocket(request)
+        mock_server = MagicMock()
+        mock_server.manager.list_models.return_value = []
+        mock_server.manager.context_window.return_value = 4096
+        mock_server.api_key = api_key
+        mock_server.allow_origin = None
+        # A MagicMock attribute is truthy, so pin it: these tests are about the
+        # token, not the Host check.
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        return sock.get_output()
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "é",             # single non-ASCII char
+            "s3cr\xe9t",      # correct prefix, non-ASCII tail
+            "\xe9" * 40,      # all non-ASCII
+            "s3crét",
+        ],
+    )
+    def test_a_non_ascii_token_is_denied_not_crashed(self, token):
+        """compare_digest raises TypeError on non-ASCII str operands.
+
+        That call sits outside the handler's try, so before this fix the
+        exception killed the connection with no response at all and printed a
+        traceback to the operator's log -- an unauthenticated log-flood.
+        """
+        out = self._handler(
+            "s3cret",
+            f"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+            f"Authorization: Bearer {token}\r\n\r\n".encode("latin-1"),
+        )
+        assert b"401" in out.split(b"\r\n")[0], (
+            "a non-ASCII token must be a clean 401"
+        )
+
+    def test_the_correct_token_still_works(self):
+        out = self._handler(
+            "s3cret",
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+            b"Authorization: Bearer s3cret\r\n\r\n",
+        )
+        assert b"200" in out.split(b"\r\n")[0]
+
+    def test_a_wrong_token_is_denied(self):
+        out = self._handler(
+            "s3cret",
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+            b"Authorization: Bearer wrong\r\n\r\n",
+        )
+        assert b"401" in out.split(b"\r\n")[0]
+
+    def test_an_empty_token_is_denied(self):
+        """compare_digest(x, "") would match an empty Authorization value."""
+        out = self._handler(
+            "s3cret",
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+            b"Authorization: Bearer \r\n\r\n",
+        )
+        assert b"401" in out.split(b"\r\n")[0]
+
+    def test_a_failed_attempt_is_logged(self, caplog):
+        """Unlimited guessing with no audit trail is not an access control."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            self._handler(
+                "s3cret",
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+                b"Authorization: Bearer wrong\r\n\r\n",
+            )
+        assert any("Rejected unauthenticated" in r.message for r in caplog.records)
+
+    def test_a_non_ascii_key_is_refused_at_startup(self, tmp_path):
+        """A key that can never match is a lock with no key in it.
+
+        http.server decodes header bytes as Latin-1, so a client cannot echo
+        back a UTF-8 key: "sécret" arrives as "sÃ©cret" and every request is
+        refused. Starting successfully and then rejecting everyone looks like
+        the network is down, so this is refused up front instead.
+        """
+        from assembly.server import AssemblyServer, ModelManager
+
+        with pytest.raises(ValueError, match="ASCII"):
+            AssemblyServer(
+                ("127.0.0.1", 0),
+                ModelManager(models_dir=str(tmp_path)),
+                api_key="sécret",
+            )
+
+
+class TestServerRequestValidation:
+    """Client-supplied values must be validated, not interpolated."""
+
+    def _load(self, manager, body: dict, api_key=None):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        payload = json.dumps(body).encode()
+        sock = MockSocket(
+            b"POST /api/load HTTP/1.1\r\nHost: localhost\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        mock_server = MagicMock()
+        mock_server.manager = manager
+        mock_server.api_key = api_key
+        mock_server.allow_origin = None
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        raw = sock.get_output()
+        status = int(raw.split(b"\r\n")[0].split()[1])
+        _, _, response_body = raw.partition(b"\r\n\r\n")
+        return status, response_body
+
+    def test_alias_must_be_a_string(self, tmp_path):
+        from assembly.server import ModelManager
+
+        mgr = ModelManager(models_dir=str(tmp_path))
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        status, _ = self._load(mgr, {"model_path": str(archive), "alias": ["a"]})
+        assert status == 400, "a list alias must not reach Path()/dict-key logic"
+
+    def test_model_path_must_be_a_string(self, tmp_path):
+        from assembly.server import ModelManager
+
+        mgr = ModelManager(models_dir=str(tmp_path))
+        status, _ = self._load(mgr, {"model_path": {"a": 1}})
+        assert status == 400
+
+    def test_alias_cannot_forge_a_log_line(self, tmp_path, caplog):
+        """A newline in the alias would append a fake entry to the operator's log."""
+        import logging
+
+        from assembly.server import ModelManager
+
+        mgr = ModelManager(models_dir=str(tmp_path))
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        with caplog.at_level(logging.INFO):
+            status, _ = self._load(
+                mgr,
+                {"model_path": str(archive), "alias": "ok\nLoaded assembly model 'x'"},
+            )
+        assert status == 400
+        assert not any(
+            "\n" in r.getMessage() for r in caplog.records
+        ), "control characters reached a log record"
+
+    def test_alias_length_is_bounded(self, tmp_path):
+        from assembly.server import ModelManager
+
+        mgr = ModelManager(models_dir=str(tmp_path))
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        status, _ = self._load(
+            mgr, {"model_path": str(archive), "alias": "a" * 10_000}
+        )
+        assert status == 400
+
+
+class TestServerErrorDisclosure:
+    """Internal detail belongs in the log, not in the response body."""
+
+    def _post(self, manager, path: str, body: dict, api_key=None):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        payload = json.dumps(body).encode()
+        sock = MockSocket(
+            f"POST {path} HTTP/1.1\r\nHost: localhost\r\n".encode()
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        mock_server = MagicMock()
+        mock_server.manager = manager
+        mock_server.api_key = api_key
+        mock_server.allow_origin = None
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        raw = sock.get_output()
+        status = int(raw.split(b"\r\n")[0].split()[1])
+        _, _, response_body = raw.partition(b"\r\n\r\n")
+        return status, response_body
+
+    def test_a_generation_error_does_not_return_llama_cpp_text(self):
+        """llama.cpp error strings name the staged blob's absolute path."""
+        from assembly.server import ModelManager
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        llm = MagicMock()
+        llm.route.return_value.model_name = "coder"
+        llm.route.return_value.model_index = 0
+        llm.route.return_value.score = 0.9
+        llm.route.return_value.is_fallback = False
+        llm.create_chat_completion.side_effect = RuntimeError(
+            "failed to load model from /private/var/folders/xy/assembly-abc/blob-1.gguf"
+        )
+        mgr._models["a"] = llm
+        mgr._active_alias = "a"
+
+        status, body = self._post(
+            mgr, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert status == 500
+        assert b"var/folders" not in body, f"staging path leaked: {body!r}"
+        assert b"blob-1.gguf" not in body
+
+    def test_a_routing_error_does_not_return_internal_text(self):
+        from assembly.server import ModelManager
+        from unittest.mock import MagicMock
+
+        mgr = ModelManager()
+        llm = MagicMock()
+        llm.route.side_effect = RuntimeError("staged at /tmp/assembly-xyz/blob-9.gguf")
+        mgr._models["a"] = llm
+        mgr._active_alias = "a"
+
+        status, body = self._post(mgr, "/api/route", {"prompt": "hi"})
+        assert status == 500
+        assert b"assembly-xyz" not in body
+
+    def test_a_capacity_error_does_not_return_disk_details(self):
+        """StagingError names the staging directory and its free space."""
+        from unittest.mock import MagicMock
+
+        from assembly.server import ModelManager
+        from assembly.wrapper import StagingError
+
+        mgr = ModelManager()
+        mgr.load_model = MagicMock(
+            side_effect=StagingError(
+                "not enough space: need 40.0 GB, only 2.1 GB free in "
+                "/private/var/folders/xy/assembly-abc"
+            )
+        )
+        status, body = self._post(
+            mgr, "/api/load", {"model_path": "/tmp/x.asmb"}
+        )
+        assert status == 429
+        assert b"var/folders" not in body
+        assert b"assembly-abc" not in body
+        assert b"GB free" not in body
+
+    def test_health_is_not_cacheable(self):
+        """/health discloses version, model id and context window."""
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        sock = MockSocket(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        mock_server = MagicMock()
+        mock_server.manager.list_models.return_value = []
+        mock_server.manager.context_window.return_value = 4096
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        out = sock.get_output().lower()
+        assert b"cache-control: no-store" in out
+        assert b"x-content-type-options: nosniff" in out
+
+
+class TestServerCORSHeaderInjection:
+    """Reflecting Origin must not be a way to write response headers."""
+
+    def _get_with_origin(self, origin: bytes, allow_origin: str):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        sock = MockSocket(
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+            b"Authorization: Bearer k\r\nOrigin: " + origin + b"\r\n\r\n"
+        )
+        mock_server = MagicMock()
+        mock_server.manager.list_models.return_value = []
+        mock_server.manager.context_window.return_value = 4096
+        mock_server.api_key = "k"
+        mock_server.allow_origin = allow_origin
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        return sock.get_output()
+
+    def test_a_folded_origin_cannot_smuggle_a_header(self):
+        """http.server does not validate header values, so a CRLF in Origin
+        writes attacker-chosen bytes into the response."""
+        out = self._get_with_origin(b"http://evil.com\r\n  X-Injected: pwned", "*")
+        assert b"X-Injected" not in out, "response header injection succeeded"
+
+    def test_a_normal_allowed_origin_is_still_reflected(self):
+        out = self._get_with_origin(b"http://localhost:5173", "http://localhost:5173")
+        assert b"Access-Control-Allow-Origin: http://localhost:5173" in out
+
+    def test_a_disallowed_origin_is_not_reflected(self):
+        out = self._get_with_origin(b"http://evil.com", "http://localhost:5173")
+        assert b"Access-Control-Allow-Origin" not in out
+
+
+class TestServerDNSRebinding:
+    """CORS is not a defence against a page that resolves to 127.0.0.1.
+
+    Such a request is same-origin to the browser, so CORS never applies. The
+    Host header is the one signal that still says who is asking.
+    """
+
+    def _get(self, host_header: bytes, require_local_host: bool):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        sock = MockSocket(
+            b"GET /health HTTP/1.1\r\nHost: " + host_header + b"\r\n\r\n"
+        )
+        mock_server = MagicMock()
+        mock_server.manager.list_models.return_value = []
+        mock_server.manager.context_window.return_value = 4096
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        mock_server.require_local_host = require_local_host
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        return int(sock.get_output().split(b"\r\n")[0].split()[1])
+
+    @pytest.mark.parametrize(
+        "host", [b"127.0.0.1:8000", b"localhost:8000", b"[::1]:8000", b"127.0.0.1"]
+    )
+    def test_loopback_hosts_are_accepted(self, host):
+        assert self._get(host, require_local_host=True) == 200
+
+    @pytest.mark.parametrize(
+        "host",
+        [b"evil.com", b"evil.com:8000", b"attacker.example", b"127.0.0.1.evil.com"],
+    )
+    def test_foreign_hosts_are_refused(self, host):
+        assert self._get(host, require_local_host=True) == 401
+
+    def test_the_check_does_not_apply_to_a_lan_listener(self):
+        """A deliberately public server is addressed by name, not by IP."""
+        assert self._get(b"models.lan:8000", require_local_host=False) == 200
+
+    def test_a_lan_listener_does_not_require_local_host(self, tmp_path):
+        """is_loopback decides this, so binding 0.0.0.0 disables the check."""
+        from assembly.server import AssemblyServer, ModelManager
+
+        srv = AssemblyServer(
+            ("127.0.0.1", 0), ModelManager(models_dir=str(tmp_path))
+        )
+        try:
+            assert srv.require_local_host is True
+        finally:
+            srv.server_close()
+
+
+class TestServerCrossOriginWrites:
+    """A web page must not be able to drive a keyless server with a simple POST.
+
+    ``text/plain`` is a CORS-safelisted content type, so the browser fires the
+    request without a preflight and merely hides the response. That is enough to
+    make a page load archives into the operator's server.
+    """
+
+    def _post(self, body: bytes, headers: dict, allow_origin=None):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        req = b"POST /api/load HTTP/1.1\r\nHost: localhost\r\n"
+        req += f"Content-Length: {len(body)}\r\n".encode()
+        req += b"".join(f"{k}: {v}\r\n".encode() for k, v in headers.items())
+        sock = MockSocket(req + b"\r\n" + body)
+        mock_server = MagicMock()
+        mock_server.manager.load_model = MagicMock(return_value="x")
+        mock_server.api_key = None
+        mock_server.allow_origin = allow_origin
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        return sock.get_output(), mock_server.manager.load_model
+
+    def test_a_foreign_origin_simple_post_is_refused(self):
+        out, load_model = self._post(
+            b'{"model_path": "/tmp/x.asmb"}',
+            {"Origin": "http://evil.com", "Content-Type": "text/plain;charset=UTF-8"},
+        )
+        assert b"403" in out.split(b"\r\n")[0]
+
+    def test_a_refused_post_performs_no_write(self):
+        """The 403 has to be the end of it, not a prelude.
+
+        The refusal used to send 403 and then fall through to the router, so the
+        very write that was just refused still happened -- the response stream
+        carried two status lines and the archive was loaded regardless of what
+        the caller was told.
+        """
+        out, load_model = self._post(
+            b'{"model_path": "/tmp/x.asmb"}',
+            {"Origin": "http://evil.com", "Content-Type": "text/plain;charset=UTF-8"},
+        )
+        assert not load_model.called, "the refused write reached the manager"
+        assert out.count(b"HTTP/1.") == 1, "two responses were written"
+
+    def test_a_non_browser_client_is_unaffected(self):
+        """curl and the OpenAI SDK send no Origin at all."""
+        out, load_model = self._post(
+            b'{"model_path": "/tmp/x.asmb"}',
+            {"Content-Type": "application/json"},
+        )
+        assert b"200" in out.split(b"\r\n")[0]
+        load_model.assert_called_once()
+
+    def test_an_explicitly_allowed_origin_may_write(self):
+        out, load_model = self._post(
+            b'{"model_path": "/tmp/x.asmb"}',
+            {"Origin": "http://localhost:5173", "Content-Type": "application/json"},
+            allow_origin="http://localhost:5173",
+        )
+        assert b"200" in out.split(b"\r\n")[0]
+        load_model.assert_called_once()
+
+
+class TestServerUnload:
+    """A capacity limit you cannot recover from is an outage, not a limit."""
+
+    def _manager(self, tmp_path, monkeypatch, max_models=2):
+        from assembly import server as server_mod
+
+        built: list = []
+
+        class Model:
+            def __init__(self, asmb_path, **kwargs):
+                built.append(asmb_path)
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(server_mod, "AssemblyLlama", Model)
+        mgr = server_mod.ModelManager(models_dir=str(tmp_path), max_models=max_models)
+        return mgr, built
+
+    def test_unload_frees_a_slot(self, tmp_path, monkeypatch):
+        mgr, _ = self._manager(tmp_path, monkeypatch, max_models=1)
+        a = tmp_path / "a.asmb"
+        b = tmp_path / "b.asmb"
+        a.write_bytes(b"x")
+        b.write_bytes(b"x")
+
+        mgr.load_model(a)
+        with pytest.raises(RuntimeError):
+            mgr.load_model(b)
+        assert mgr.unload_model("a") == []
+        assert mgr.load_model(b) == "b", "the slot was not reusable"
+
+    def test_unload_closes_the_model(self, tmp_path, monkeypatch):
+        mgr, built = self._manager(tmp_path, monkeypatch)
+        a = tmp_path / "a.asmb"
+        a.write_bytes(b"x")
+        mgr.load_model(a)
+        loaded = mgr._models["a"]
+        mgr.unload_model("a")
+        assert loaded.closed, "the archive's memory was never released"
+        assert "a" not in mgr._models
+
+    def test_unloading_the_active_model_picks_another(self, tmp_path, monkeypatch):
+        mgr, _ = self._manager(tmp_path, monkeypatch)
+        a, b = tmp_path / "a.asmb", tmp_path / "b.asmb"
+        a.write_bytes(b"x")
+        b.write_bytes(b"x")
+        mgr.load_model(a, alias="a", set_active=True)
+        mgr.load_model(b, alias="b", set_active=True)
+        mgr.unload_model("b")
+        alias, _ = mgr.get_active()
+        assert alias == "a", "the active alias pointed at an unloaded model"
+
+    def test_unloading_the_last_model_leaves_none_active(self, tmp_path, monkeypatch):
+        mgr, _ = self._manager(tmp_path, monkeypatch)
+        a = tmp_path / "a.asmb"
+        a.write_bytes(b"x")
+        mgr.load_model(a, alias="a")
+        mgr.unload_model("a")
+        with pytest.raises(RuntimeError):
+            mgr.get_active()
+
+    def test_unloading_something_absent_is_a_400(self, tmp_path, monkeypatch):
+        mgr, _ = self._manager(tmp_path, monkeypatch)
+        from assembly.server import _BadRequest
+
+        with pytest.raises(_BadRequest, match="no such loaded model"):
+            mgr.unload_model("ghost")
+
+    def test_the_unload_endpoint_exists(self, tmp_path):
+        """The 429 told clients to unload; there had to be a way to."""
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({"alias": "a"}).encode()
+        sock = MockSocket(
+            b"POST /api/unload HTTP/1.1\r\nHost: localhost\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        mock_server = MagicMock()
+        mock_server.manager.unload_model.return_value = ["b"]
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        out = sock.get_output()
+        assert b"200" in out.split(b"\r\n")[0]
+        mock_server.manager.unload_model.assert_called_once_with("a")
+        assert b'"remaining": ["b"]' in out
+
+    def test_a_refused_load_points_at_the_unload_endpoint(self, tmp_path):
+        from assembly.server import AssemblyRequestHandler
+        from unittest.mock import MagicMock
+
+        payload = json.dumps({"model_path": "/tmp/x.asmb"}).encode()
+        sock = MockSocket(
+            b"POST /api/load HTTP/1.1\r\nHost: localhost\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        mock_server = MagicMock()
+        mock_server.manager.load_model.side_effect = RuntimeError("at limit")
+        mock_server.api_key = None
+        mock_server.allow_origin = None
+        mock_server.require_local_host = False
+        AssemblyRequestHandler(sock, ("127.0.0.1", 8000), mock_server)
+        assert b"/api/unload" in sock.get_output()
+
+
+class TestServerResourceLimits:
+    """The limits the README claims must actually be limits."""
+
+    def test_the_model_cap_holds_under_concurrent_loads(self, tmp_path, monkeypatch):
+        """20 simultaneous /api/load calls must not all pass an 8-model budget.
+
+        The capacity check and the (multi-second) load used to be separate
+        critical sections, so every concurrent request saw an empty slot and
+        passed -- each request then materialised and kept a model.
+        """
+        import time as tm
+        import concurrent.futures as cf
+
+        from assembly import server as server_mod
+
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+
+        class SlowModel:
+            def __init__(self, **kwargs):
+                tm.sleep(0.3)  # a real archive load takes seconds to minutes
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(server_mod, "AssemblyLlama", SlowModel)
+        mgr = server_mod.ModelManager(models_dir=str(tmp_path), max_models=4)
+
+        def load(i):
+            try:
+                mgr.load_model(archive, alias=f"a{i}")
+                return 200
+            except RuntimeError:
+                return 429
+
+        with cf.ThreadPoolExecutor(max_workers=20) as pool:
+            codes = list(pool.map(load, range(20)))
+
+        assert codes.count(200) == 4, f"cap breached: {codes.count(200)} loaded"
+        assert len(mgr._models) == 4
+        assert not mgr._loading, "a reservation was leaked"
+
+    def test_a_failed_load_releases_its_reservation(self, tmp_path, monkeypatch):
+        """An exception mid-load must not permanently consume a slot."""
+        from assembly import server as server_mod
+
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+
+        class Failing:
+            def __init__(self, **kwargs):
+                raise OSError("no space left on device")
+
+        monkeypatch.setattr(server_mod, "AssemblyLlama", Failing)
+        mgr = server_mod.ModelManager(models_dir=str(tmp_path), max_models=1)
+
+        for _ in range(3):
+            with pytest.raises(OSError):
+                mgr.load_model(archive, alias="a")
+        assert not mgr._loading, "a failed load leaked its reservation"
+
+    def test_replacing_a_model_is_not_treated_as_new_capacity(self, tmp_path, monkeypatch):
+        """Re-loading an existing alias must work at the limit."""
+        from assembly import server as server_mod
+
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+
+        class Model:
+            def __init__(self, **kwargs):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(server_mod, "AssemblyLlama", Model)
+        mgr = server_mod.ModelManager(models_dir=str(tmp_path), max_models=1)
+        mgr.load_model(archive, alias="only")
+        mgr.load_model(archive, alias="only")  # replacement, must not raise
+        assert list(mgr._models) == ["only"]
+
+    def test_concurrent_loads_of_one_alias_consume_one_slot_each(
+        self, tmp_path, monkeypatch
+    ):
+        """A reservation is per in-flight load, not per alias name.
+
+        With `_loading` as a set, two simultaneous loads of the same alias shared
+        a single reservation. The second install then found nothing to displace,
+        so the first model was dropped without being closed and both copies of
+        its weights stayed resident -- a quiet way to double memory use past the
+        configured limit.
+        """
+        import concurrent.futures as cf
+        import time as tm
+
+        from assembly import server as server_mod
+
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        built: list = []
+
+        class SlowModel:
+            def __init__(self, **kwargs):
+                built.append(kwargs.get("asmb_path"))
+                tm.sleep(0.2)
+
+            def close(self):
+                built.append("closed")
+
+        monkeypatch.setattr(server_mod, "AssemblyLlama", SlowModel)
+        mgr = server_mod.ModelManager(models_dir=str(tmp_path), max_models=1)
+
+        with cf.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(mgr.load_model, archive, alias="same")
+                for _ in range(4)
+            ]
+            outcomes = []
+            for f in futures:
+                try:
+                    outcomes.append(("ok", f.result()))
+                except RuntimeError:
+                    outcomes.append(("refused", None))
+
+        accepted = [o for o in outcomes if o[0] == "ok"]
+        assert len(accepted) == 1, (
+            f"max_models=1 admitted {len(accepted)} concurrent loads of one alias"
+        )
+        assert len(mgr._models) == 1
+
+    def test_a_replaced_model_is_closed_not_leaked(self, tmp_path, monkeypatch):
+        """Replacing an alias closes what it displaces, even under concurrency.
+
+        Two simultaneous loads of a resident alias both pass the capacity check
+        (a replacement consumes no new slot), so both build a model. The second
+        install must close the first one's instance; otherwise every reload
+        leaks a full copy of the weights.
+        """
+        import concurrent.futures as cf
+
+        from assembly import server as server_mod
+
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        built: list = []
+
+        class Model:
+            def __init__(self, **kwargs):
+                built.append(kwargs.get("asmb_path"))
+
+            def close(self):
+                built.append("closed")
+
+        monkeypatch.setattr(server_mod, "AssemblyLlama", Model)
+        mgr = server_mod.ModelManager(models_dir=str(tmp_path), max_models=1)
+        mgr.load_model(archive, alias="same")
+
+        with cf.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(mgr.load_model, archive, alias="same")
+                for _ in range(2)
+            ]
+            for f in futures:
+                f.result()
+
+        assert len(mgr._models) == 1
+        # 1 initial + 2 replacements built, and the 2 that were superseded are
+        # closed, leaving exactly the one still installed.
+        assert built.count("closed") == 2, f"leaked a model: {built}"
+        assert not mgr._loading, "a reservation was leaked"
+
+    def test_a_refused_connection_returns_no_slot(self, tmp_path):
+        """Refusing a connection must not over-release the semaphore.
+
+        The refusal path used to call shutdown_request(), which is the same hook
+        the worker calls on completion, so every refused connection gave back a
+        slot it had never taken. BoundedSemaphore raises ValueError on
+        over-release, so a client opening a few sockets past the ceiling could
+        take the server down.
+        """
+        import socket as sk
+        import threading as th
+        import time as tm
+
+        from assembly.server import (
+            AssemblyServer,
+            MAX_CONCURRENT_CONNECTIONS,
+            ModelManager,
+        )
+
+        # serve_forever() has to be running: without an accept loop nothing
+        # acquires a slot and the test would pass for the wrong reason.
+        srv = AssemblyServer(("127.0.0.1", 0), ModelManager(models_dir=str(tmp_path)))
+        th.Thread(target=srv.serve_forever, daemon=True).start()
+        held: list = []
+        try:
+            for _ in range(MAX_CONCURRENT_CONNECTIONS):
+                held.append(sk.create_connection(srv.server_address, timeout=5))
+            # Every slot is held; these connections are accepted by the kernel
+            # and then closed by the refusal path.
+            for _ in range(10):
+                sk.create_connection(srv.server_address, timeout=5).close()
+
+            assert srv._connection_slots._value == 0, "slots were handed out early"
+            for s in held:
+                s.close()
+            for _ in range(200):
+                if srv._connection_slots._value == MAX_CONCURRENT_CONNECTIONS:
+                    break
+                tm.sleep(0.05)
+            assert srv._connection_slots._value == MAX_CONCURRENT_CONNECTIONS, (
+                "slots did not balance after a refusal storm: "
+                f"{srv._connection_slots._value}"
+            )
+            assert srv._active_connections == 0
+        finally:
+            for s in held:
+                s.close()
+            srv.shutdown()
+            srv.server_close()
+
+    def test_connections_are_capped(self, tmp_path):
+        """ThreadingHTTPServer has no thread ceiling of its own."""
+        from assembly.server import (
+            AssemblyServer,
+            MAX_CONCURRENT_CONNECTIONS,
+            ModelManager,
+        )
+
+        srv = AssemblyServer(("127.0.0.1", 0), ModelManager(models_dir=str(tmp_path)))
+        try:
+            assert srv._connection_slots is not None
+            # Hold every slot, then confirm the next connection is refused
+            # rather than spawning another worker.
+            for _ in range(MAX_CONCURRENT_CONNECTIONS):
+                assert srv._connection_slots.acquire(blocking=False)
+            assert not srv._connection_slots.acquire(blocking=False)
+        finally:
+            srv.server_close()
+
+    def test_connections_are_registered_for_the_watchdog(self, tmp_path):
+        """A dribbling client must be reaped on wall-clock, not per-recv."""
+        from assembly.server import AssemblyServer, ModelManager
+
+        srv = AssemblyServer(("127.0.0.1", 0), ModelManager(models_dir=str(tmp_path)))
+        try:
+            handler = object()
+            srv.register_connection(handler)
+            try:
+                assert id(handler) in srv._connections
+                # A deadline is what makes a 1-byte-per-4-minutes client
+                # survivable, so the age must be recorded.
+                started, _ = srv._connections[id(handler)]
+                assert started > 0
+            finally:
+                srv.forget_connection(handler)
+            assert id(handler) not in srv._connections
+        finally:
+            srv.server_close()
+
+    def test_an_empty_api_key_is_refused(self, tmp_path):
+        """api_key="" used to mean "no auth" with no warning at all."""
+        from assembly.server import AssemblyServer, ModelManager
+
+        with pytest.raises(ValueError, match="non-empty"):
+            AssemblyServer(
+                ("127.0.0.1", 0),
+                ModelManager(models_dir=str(tmp_path)),
+                api_key="",
+            )
+
+
+class TestServerModelsDirDefault:
+    """/api/load must not be an arbitrary-file opener by default."""
+
+    def test_serve_defaults_the_jail_to_the_archives_directory(
+        self, tmp_path, monkeypatch
+    ):
+        from assembly import server as server_mod
+
+        archive = tmp_path / "mesh.asmb"
+        archive.write_bytes(b"x")
+        loaded: list = []
+        _stub_load_model(monkeypatch, server_mod, loaded)
+        captured = _record_manager_kwargs(monkeypatch, server_mod)
+        monkeypatch.setattr(server_mod, "AssemblyServer", _stub_server_factory())
+
+        server_mod.serve(model_path=archive, host="127.0.0.1", port=0)
+        assert Path_is(captured["models_dir"], archive.parent)
+        assert loaded, "serve() did not ask to load the archive"
+
+    def test_an_explicit_models_dir_is_respected(self, tmp_path, monkeypatch):
+        from assembly import server as server_mod
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        archive = elsewhere / "mesh.asmb"
+        archive.write_bytes(b"x")
+        loaded: list = []
+        _stub_load_model(monkeypatch, server_mod, loaded)
+        captured = _record_manager_kwargs(monkeypatch, server_mod)
+        monkeypatch.setattr(server_mod, "AssemblyServer", _stub_server_factory())
+
+        server_mod.serve(
+            model_path=archive, host="127.0.0.1", port=0, models_dir=elsewhere
+        )
+        assert Path_is(captured["models_dir"], elsewhere.resolve())
+
+    def test_a_path_outside_the_jail_is_refused(self, tmp_path):
+        """The behaviour the default now relies on."""
+        from assembly.server import ModelManager
+
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        (allowed / "ok.asmb").write_bytes(b"x")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "evil.asmb").write_bytes(b"x")
+
+        mgr = ModelManager(models_dir=str(allowed))
+        assert mgr._authorize_path(allowed / "ok.asmb").name == "ok.asmb"
+        with pytest.raises(PermissionError):
+            mgr._authorize_path(outside / "evil.asmb")
+
+    def test_the_help_text_no_longer_claims_the_current_directory(self):
+        """It said "(default: current directory)", which was never true."""
+        assert "current directory" not in _serve_help("models_dir")
+        assert "served archive" in _serve_help("models_dir")
+
+
+class _StubServer:
+    """Stands in for AssemblyServer so serve() can be observed, not run.
+
+    serve() binds a real socket and blocks, so a stub has to accept the
+    constructor's arguments without inheriting from the real class (whose
+    __init__ is what we are avoiding).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.server_address = ("127.0.0.1", 0)
+        self.kwargs = kwargs
+
+    def serve_forever(self):
+        raise KeyboardInterrupt
+
+    def server_close(self):
+        pass
+
+
+def _stub_server_factory():
+    """A stand-in for AssemblyServer that records how it was constructed."""
+    return _StubServer
+
+
+def Path_is(actual, expected) -> bool:
+    """Both arguments may be a Path, str, or None."""
+    import pathlib as _p
+
+    if actual is None:
+        return False
+    return _p.Path(actual) == _p.Path(expected)
+
+
+
+def _stub_load_model(monkeypatch, server_mod, loaded: list) -> None:
+    """Replace load_model so serve() need not parse a real .asmb archive.
+
+    serve() eagerly loads the archive it is given; without this the tests have
+    to ship a valid multi-megabyte model just to observe which models_dir it
+    picked. The stub still runs _authorize_path, so jail violations surface.
+    """
+    real_load = server_mod.ModelManager.load_model
+
+    def recording_load(self, model_path, *args, **kwargs):
+        loaded.append(self._authorize_path(model_path))
+        return kwargs.get("alias") or "default"
+
+    monkeypatch.setattr(server_mod.ModelManager, "load_model", recording_load)
+    assert real_load is not None
+
+
+def _record_manager_kwargs(monkeypatch, server_mod) -> dict:
+    """Record the kwargs serve() builds a ModelManager with, keeping it usable.
+
+    serve() goes on to print a banner that calls manager.describe_models(), so
+    __init__ must still run -- replacing it outright leaves the instance without
+    its lock and the banner raises.
+    """
+    captured: dict = {}
+    real_init = server_mod.ModelManager.__init__
+
+    def recording_init(self, *args, **kwargs):
+        captured.update(kwargs)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(server_mod.ModelManager, "__init__", recording_init)
+    return captured
+
+
+def _serve_help(dest: str) -> str:
+    """The --help text of one `assembly serve` option, by argparse dest."""
+    from assembly.main import _build_parser
+
+    parser = _build_parser()
+    subparsers = [
+        action for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+    serve = subparsers[0].choices["serve"]
+    for action in serve._actions:
+        if action.dest == dest:
+            return action.help or ""
+    raise AssertionError(f"no serve option with dest {dest!r}")
+
+
+class TestServerLogSanitisation:
+    """Attacker-controlled text must not reach the operator's terminal raw."""
+
+    def test_escapes_are_stripped(self):
+        from assembly.server import _sanitize_for_log
+
+        out = _sanitize_for_log("GET /\x1b[2J\x1b[1;31mFAKE\x1b[0m HTTP/1.1")
+        assert "\x1b" not in out
+        assert "FAKE" in out, "the visible text is kept, only the escapes go"
+
+    def test_newlines_cannot_forge_log_lines(self):
+        from assembly.server import _sanitize_for_log
+
+        out = _sanitize_for_log("GET / HTTP/1.1\r\nLoaded model 'x'")
+        assert "\n" not in out and "\r" not in out
+
+    def test_long_input_is_truncated(self):
+        from assembly.server import _sanitize_for_log
+
+        assert len(_sanitize_for_log("a" * 10_000)) <= 210
+
+    def test_ordinary_text_is_untouched(self):
+        from assembly.server import _sanitize_for_log
+
+        text = 'GET /v1/chat/completions HTTP/1.1" 200 -'
+        assert _sanitize_for_log(text) == text
+
+
+class TestServeTempDirForwarded:
+    """--temp-dir was accepted by serve and then dropped on the floor."""
+
+    def test_serve_forwards_temp_dir(self, tmp_path, monkeypatch):
+        from assembly import server as server_mod
+
+        captured = _record_manager_kwargs(monkeypatch, server_mod)
+        monkeypatch.setattr(server_mod, "AssemblyServer", _stub_server_factory())
+
+        server_mod.serve(host="127.0.0.1", port=0, temp_dir=tmp_path)
+        assert Path_is(captured["temp_dir"], tmp_path)
+
+    def test_the_serve_subcommand_passes_it_through(self, tmp_path, monkeypatch):
+        """The wiring in main.py, not server.py's signature."""
+        from assembly import main as main_mod
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            "assembly.server.serve",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        args = argparse.Namespace(
+            command="serve", model=str(archive), host="127.0.0.1", port=0,
+            persona=None, n_gpu_layers=0, verbose=False, api_key=None,
+            allow_origin=None, models_dir=None, temp_dir=tmp_path,
+        )
+        main_mod._cmd_serve(args)
+        assert Path_is(seen["temp_dir"], tmp_path), (
+            "serve --temp-dir is still dropped before it reaches the server"
+        )

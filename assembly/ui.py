@@ -52,6 +52,12 @@ err = Console(stderr=True, highlight=False, soft_wrap=True)
 _NO_COLOR = "NO_COLOR" in os.environ
 _DUMB = os.environ.get("TERM") == "dumb"
 
+# The legacy Windows console (pre-Windows 10, or VT processing disabled) has no
+# ANSI support, and `input()` prints its prompt straight to the console without
+# going through rich. An escape sequence there is not stripped, it is printed,
+# so the user sees "^[[38;2;255;158;61m" in front of every line they type.
+_LEGACY_WINDOWS_CONSOLE = bool(getattr(out, "legacy_windows", False))
+
 # Force plain text when the stream is not a terminal so that redirected
 # output contains no escape sequences at all.
 if _NO_COLOR or _DUMB:
@@ -132,7 +138,11 @@ def prompt_text() -> str:
     prints the returned string itself, so a console pointed at stdout would
     emit the prompt twice.
     """
-    if _NO_COLOR:
+    # A legacy Windows console cannot interpret these codes, so colour there is
+    # a bug, not a downgrade. The same goes for a redirected stdout: input()
+    # writes this string straight to the file or pipe, where escape sequences
+    # are just noise in someone's captured output.
+    if _NO_COLOR or _DUMB or _LEGACY_WINDOWS_CONSOLE or not sys.stdout.isatty():
         return "▸ "
     sink = StringIO()
     scratch = Console(
@@ -141,7 +151,10 @@ def prompt_text() -> str:
     scratch.print(
         Text("▸ ", style=Style(color=Color.parse(ORANGE), bold=True)), end=""
     )
-    return scratch.export_text().rstrip()
+    # styles=True is what puts the escape codes back in. Without it rich
+    # returns the plain characters and the prompt is unstyled on every
+    # platform -- the colour is silently dropped, not applied.
+    return scratch.export_text(styles=True).rstrip()
 
 
 def rule(width: int = 60) -> None:

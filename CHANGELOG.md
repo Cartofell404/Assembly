@@ -5,6 +5,131 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`-m` is now required and must be an absolute path**, for `serve`, `info`,
+  and for `run` on its local-inference path. Archive paths were previously
+  guessed from the working directory when `-m` was omitted, which meant serving
+  from the wrong folder silently loaded whatever `.asmb` happened to be sitting
+  in it — and then handed that archive to every client that asked the server. A
+  relative path is refused with the absolute form spelled out, and
+  `~`/`$VARS` still expand as usual. `run -s URL -m <alias>` is unaffected: there
+  `-m` names an already-loaded model on a server, not a file.
+
+  A side effect: because `serve` can no longer start without an archive, there
+  is always a directory to confine `/api/load` to, so the unconfined case
+  described below is no longer reachable from the command line. Only a direct
+  `assembly.server.serve()` call from Python can still leave it unconfined.
+
+### Security
+
+The HTTP server had a handful of issues that a browser, an unauthenticated
+local process, or a client holding the key could turn into resource exhaustion
+or information disclosure. See the new "Security model" section in the README
+for what is and is not defended against.
+
+Fixed:
+
+- `/api/load` was an arbitrary-file opener. Any client could ask for any path
+  the server user could read, and Assembly would hand it to the archive parser.
+  It is now confined to `--models-dir`, which defaults to the served archive's
+  own directory; paths are resolved first, so `..` and symlinks cannot escape.
+  Starting `assembly serve` with no `-m` archive still leaves the endpoint
+  unconfined — there is no directory to default to — and the startup banner says
+  so explicitly. (`-m` is now required, so that case is CLI-unreachable.)
+- A cross-origin `POST` was answered with `403` and then **performed anyway**.
+  The refusal wrote its response and fell through to the router, so any page the
+  operator visited could still load multi-gigabyte archives into their server
+  (a `text/plain` POST needs no preflight, so the browser sends it and merely
+  hides the reply). The handler now stops at the refusal.
+- The model-count limit was not enforced under concurrency. The capacity check
+  and the multi-second load were separate critical sections, so N simultaneous
+  requests each saw a free slot and all stayed resident. Reservations now span
+  the load. They are also counted per in-flight load rather than per alias:
+  with one reservation per name, two concurrent loads of the *same* alias
+  shared a slot, and the second silently discarded the first model without
+  closing it, leaving two copies of its weights resident.
+- Concurrent connections were unbounded. `ThreadingHTTPServer` spawns a thread
+  per accepted connection, so a client holding a few hundred idle sockets grew
+  the thread count to match. Connections are now capped at 32, and each has a
+  300-second wall-clock deadline, so a client trickling one byte per minute can
+  no longer hold a thread open indefinitely.
+- A non-ASCII bearer token crashed the connection handler.
+  `secrets.compare_digest` raises `TypeError` on non-ASCII `str`, and the call
+  sat outside the handler's `try`, so an unauthenticated request produced a
+  traceback on stderr and no response at all — a log-flood available to anyone
+  who could reach the port. Tokens are now compared as bytes. Symmetrically, a
+  non-ASCII key is refused at startup: HTTP headers are Latin-1 on the wire, so
+  such a key could never be echoed back by a client and would have locked
+  everyone out.
+- Error messages no longer disclose filesystem detail. A staging failure
+  reports the archive's staging directory and its free space in its message,
+  which was returned verbatim — enough to map the server's disk. Clients now
+  get a status and a reason; the detail stays in the log. Model-not-found and
+  not-an-archive are reported identically, so `/api/load` is not a file
+  existence oracle.
+- Attacker-controlled text can no longer forge log entries. Paths, aliases,
+  `Origin` and `Host` headers, and failed request lines had their control
+  characters stripped before reaching the log, so a request could no longer
+  inject newlines or terminal escapes.
+- `Host` is now checked on loopback listeners, and responses carry
+  `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. A browser
+  treats a rebound `evil.com → 127.0.0.1` request as same-origin, so CORS alone
+  never applied; the `Host` check closes that route into a keyless local server.
+
+Added:
+
+- `POST /api/unload` with an `alias`. The model limit used to be a one-way
+  door: a `429` told the client to "unload one first" while offering no way to
+  unload, so the only recovery was restarting the server.
+- A "Security model" section in the README, covering the enforced controls and,
+  more importantly, the ones that do not exist: no TLS, no rate limiting, no
+  accounts or quotas, serialised generation, and in-process parsing of
+  untrusted `.asmb` archives.
+
+### Fixed
+
+- Windows no longer kills a running build when it sweeps abandoned partial
+  files. The liveness probe used `os.kill(pid, 0)`, which signals nothing on
+  POSIX but, on Windows, CPython forwards every signal except `CTRL_C_EVENT`
+  and `CTRL_BREAK_EVENT` straight to `TerminateProcess`. Starting a second
+  build would therefore kill the first one and then delete its half-written
+  multi-gigabyte partial. The probe now opens the process with
+  `OpenProcess`/`GetExitCodeProcess` on Windows, which cannot affect it, and
+  declares its ctypes signatures so a 64-bit `HANDLE` is not truncated.
+- Staged model blobs no longer break on Windows. The file was handed to
+  `llama.cpp` while still open, which Windows refuses to let another process
+  re-open; the blob is now written and closed first. Removal is best-effort,
+  since Windows keeps a mapped file locked for as long as `llama.cpp` holds
+  the model — the space is reclaimed at exit instead of raising.
+- A `--temp-dir` the user points Assembly at is no longer deleted on their
+  behalf. Only the private `assembly-*` directory Assembly creates is removed at
+  exit, and only that.
+- A failed or interrupted build no longer leaves `SIGINT` ignored for the rest
+  of the process, which made Ctrl-C unusable afterwards. Signal handlers are
+  restored in a `finally`, and a second Ctrl-C during a build can no longer
+  unwind through a different path than the one that cleans up.
+- Rebuilding over an archive that is currently being served now says so.
+  Windows will not replace a file another process has open, so `assembly build`
+  previously failed with a bare permission error after the whole pack.
+- The REPL prompt is no longer uncoloured on every platform: rich's
+  `export_text` returns plain characters unless asked for styles, so the arrow
+  was silently stripped of its colour. It is also now plain on a legacy
+  Windows console, which cannot interpret the escape codes and would print
+  them as visible `^[[38;2;...` garbage.
+
+### Added
+
+- Windows is now a tested platform rather than an assumed one: the CI matrix
+  covers `windows-latest` alongside Linux and macOS, including a check that
+  the process-liveness probe leaves a real child process running.
+- `history` extra (`pip install -e ".[history]"`) pulling in `pyreadline3` on
+  Windows, where `readline` is not part of the standard library. Without it the
+  REPL works but has no arrow-key editing or saved history, and now says so.
+- Windows-specific installation and troubleshooting notes in the README.
+
 ## [0.1.0] — 2026-09-30
 
 First public release. Treat the archive format as experimental: it is versioned
