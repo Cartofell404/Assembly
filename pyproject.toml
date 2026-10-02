@@ -27,7 +27,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "llama-cpp-python>=0.2.70",
+    # 0.3.35 is the floor because Llama.embed(), which the packer needs to
+    # compute anchor vectors, does not exist on the 0.2 line.
+    "llama-cpp-python>=0.3.35",
     "numpy>=1.24",
     "rich>=13.0",
 ]

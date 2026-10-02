@@ -56,6 +56,36 @@ def _cmd_build(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _verify_archive(header, mm, path: Path) -> bool:
+    """Re-hash every blob and report mismatches. Returns True if all match.
+
+    Reads through the same memory map the header describes, so this proves
+    the recorded digests describe *this* archive rather than whatever was on
+    disk when it was built. Slow on purpose: it is opt-in via ``--verify``.
+    """
+    from assembly.header import hash_region
+
+    ok = True
+    entries = [(header.embedding.name, header.embedding.offset,
+                header.embedding.size, header.embedding.sha256)]
+    entries += [(m.name, m.offset, m.size, m.sha256) for m in header.models]
+
+    for name, offset, size, expected in entries:
+        if not expected:
+            print(f"  {name}: no digest recorded, skipped")
+            continue
+        print(f"  {name} …", end="", flush=True)
+        actual = hash_region(mm, offset, size)
+        if actual == expected:
+            print(" ok")
+        else:
+            ok = False
+            print(" MISMATCH")
+            print(f"    expected {expected}")
+            print(f"    actual   {actual}")
+    return ok
+
+
 def _cmd_info(args: argparse.Namespace) -> None:
     """Handle ``assembly info``."""
     import mmap as _mmap
@@ -69,12 +99,25 @@ def _cmd_info(args: argparse.Namespace) -> None:
         try:
             with _mmap.mmap(fh.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
                 header = read_header(mm)
+                verified = _verify_archive(header, mm, path) \
+                    if getattr(args, "verify", False) else None
         except InvalidArchiveError as exc:
             ui.error(str(exc))
             sys.exit(1)
         except OSError as exc:
             ui.error(f"could not read {path}: {exc}")
             sys.exit(1)
+
+    if verified is not None:
+        print()
+        if not verified:
+            ui.error(
+                f"{path} is corrupt: blob digests do not match the header. "
+                f"Rebuild it with 'assembly build'."
+            )
+            sys.exit(1)
+        ui.success(f"{path} verified: every blob matches its recorded SHA-256.")
+        print()
 
     total = sum(m.size for m in header.models) + header.embedding.size
     print(f"Assembly : {header.assembly_name}")
@@ -90,16 +133,22 @@ def _cmd_info(args: argparse.Namespace) -> None:
     print(f"  size   : {emb.size:,} B  ({emb.size / 1e6:.1f} MB)")
     print(f"  threshold: {emb.confidence_threshold}")
     print(f"  fallback : {emb.fallback_model}")
+    if emb.sha256:
+        print(f"  sha256   : {emb.sha256}")
     print()
     for i, m in enumerate(header.models):
         print(f"Model [{i}]: {m.name}")
         print(f"  offset : {m.offset:#x}  ({m.offset:,} B)")
         print(f"  size   : {m.size:,} B  ({m.size / 1e6:.1f} MB)")
         print(f"  anchors: {m.anchors}")
-        n_embs = len(m.anchor_embeddings)
-        if n_embs:
-            dim = len(m.anchor_embeddings[0]) if m.anchor_embeddings else 0
-            print(f"  embeddings: {n_embs} vectors × {dim} dims")
+        vecs = m.anchor_vectors()
+        if vecs:
+            print(
+                f"  embeddings: {len(vecs)} vectors × {m.anchor_dim} dims "
+                f"(float32)"
+            )
+        if m.sha256:
+            print(f"  sha256: {m.sha256}")
         print()
 
 
@@ -953,6 +1002,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="/path/to/models.asmb",
         help="Absolute path to the .asmb archive (required; not guessed from "
              "the current directory)",
+    )
+    p_info.add_argument(
+        "--verify",
+        action="store_true",
+        help="Re-hash every blob and compare against the digests recorded in "
+             "the header. Reads the whole archive, so on a multi-gigabyte file "
+             "this takes a while.",
     )
     p_info.set_defaults(func=lambda args: _cmd_info(args))
 

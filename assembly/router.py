@@ -44,8 +44,9 @@ class Router:
         # Build a mapping: model_index → (model_name, anchor_matrix)
         self._models: list[tuple[str, NDArray[np.float32]]] = []
         for entry in header.models:
-            if entry.anchor_embeddings:
-                mat = np.array(entry.anchor_embeddings, dtype=np.float32)
+            vectors = entry.anchor_vectors()
+            if vectors:
+                mat = np.array(vectors, dtype=np.float32)
                 # Pre-normalise anchors for fast cosine similarity.
                 norms = np.linalg.norm(mat, axis=1, keepdims=True)
                 norms = np.where(norms == 0, 1.0, norms)

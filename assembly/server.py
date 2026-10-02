@@ -43,7 +43,7 @@ from typing import Any, Optional
 
 from assembly import __version__, ui
 from assembly.config import SamplingParams, sampling_params_from_body
-from assembly.wrapper import AssemblyLlama
+from assembly.wrapper import DEFAULT_MAX_LOADED_MODELS, AssemblyLlama
 
 logger = logging.getLogger("assembly.server")
 
@@ -112,6 +112,7 @@ class ModelManager:
         models_dir: Optional[str | Path] = None,
         temp_dir: Optional[str | Path] = None,
         max_models: int = MAX_LOADED_MODELS,
+        max_loaded_models: int = DEFAULT_MAX_LOADED_MODELS,
     ) -> None:
         self._lock = threading.Lock()
         self._models: dict[str, AssemblyLlama] = {}
@@ -128,6 +129,10 @@ class ModelManager:
         self._persona = persona
         self._n_gpu_layers = n_gpu_layers
         self._verbose = verbose
+        #: Submodels resident per archive. Distinct from ``max_models``, which
+        #: caps how many *archives* are open: one archive can hold several
+        #: models, and that inner set is what the wrapper evicts between.
+        self._max_loaded_models = max_loaded_models
         self._max_models = max_models
         self._temp_dir = temp_dir
         self._models_dir = (
@@ -221,6 +226,7 @@ class ModelManager:
                 n_gpu_layers=self._n_gpu_layers,
                 verbose=self._verbose,
                 temp_dir=self._temp_dir,
+                max_loaded_models=self._max_loaded_models,
             )
         except BaseException:
             with self._lock:

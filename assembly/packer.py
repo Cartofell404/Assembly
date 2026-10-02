@@ -21,6 +21,7 @@ build never leaves a file that looks loadable.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import mmap
 import os
 import pathlib
@@ -33,10 +34,13 @@ from assembly.header import (
     AsmbHeader,
     EmbeddingEntry,
     ModelEntry,
+    HASH_CHUNK,
     align_to_page,
+    encode_anchors_with_dim,
     read_header,
     write_preamble,
 )
+from assembly.wrapper import Backend, LlamaCppBackend
 
 
 #: Whether we are running on Windows. Resolved once at import so the platform
@@ -285,6 +289,7 @@ def _file_size(path: pathlib.Path) -> int:
 def _compute_anchor_embeddings(
     embedding_model_path: pathlib.Path,
     models_cfg: list,
+    backend: Backend | None = None,
 ) -> dict[str, list[list[float]]]:
     """Load the embedding model and compute anchor vectors.
 
@@ -292,22 +297,23 @@ def _compute_anchor_embeddings(
     """
     # Import here to allow the rest of the package to be imported without
     # llama-cpp-python installed (useful for testing/CI).
-    from llama_cpp import Llama
+    if backend is None:
+        backend = LlamaCppBackend()
 
     print(f"  ↳ Loading embedding model: {embedding_model_path}")
-    llm = Llama(
-        model_path=str(embedding_model_path),
+    llm = backend.load(
+        str(embedding_model_path),
         embedding=True,
         n_ctx=512,
+        n_gpu_layers=0,
         n_batch=512,
-        verbose=False,
     )
 
     result: dict[str, list[list[float]]] = {}
     for mcfg in models_cfg:
         vecs: list[list[float]] = []
         for anchor_text in mcfg.anchors:
-            emb = llm.embed(anchor_text)
+            emb = backend.embed(llm, anchor_text)
             # llm.embed returns list[float] for a single string
             if isinstance(emb[0], list):
                 emb = emb[0]
@@ -316,8 +322,26 @@ def _compute_anchor_embeddings(
         print(f"    • {mcfg.name}: {len(vecs)} anchors embedded")
 
     # Explicitly free the model to release memory before packing.
-    del llm
+    backend.release(llm)
     return result
+
+
+def _dig_key(name: str, size: int) -> str:
+    """Key for the per-blob digest table.
+
+    Keyed on name *and* size: a rebuild that picks up a differently-sized
+    model under the same name must not inherit the old digest.
+    """
+    return f"{name}\x00{size}"
+
+
+def _hash_file(path: pathlib.Path) -> str:
+    """SHA-256 of a source model file, read in bounded chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(HASH_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def build(
@@ -326,6 +350,7 @@ def build(
     *,
     skip_embeddings: bool = False,
     check_gguf_magic: bool = True,
+    backend: Backend | None = None,
 ) -> pathlib.Path:
     """Build an .asmb archive.
 
@@ -340,6 +365,9 @@ def build(
         tests where no real GGUF models are available).
     check_gguf_magic:
         If *True*, verifies that input files start with the GGUF header magic.
+    backend:
+        :class:`~assembly.wrapper.Backend` used to compute anchor embeddings.
+        Defaults to a real llama.cpp backend; tests pass a fake.
 
     Returns
     -------
@@ -372,11 +400,24 @@ def build(
     # ── 2. Pre-compute anchor embeddings ─────────────────────────────
     anchor_embs: dict[str, list[list[float]]] = {}
     if not skip_embeddings:
-        anchor_embs = _compute_anchor_embeddings(cfg.embedding.path, cfg.models)
+        anchor_embs = _compute_anchor_embeddings(
+            cfg.embedding.path, cfg.models, backend=backend
+        )
 
     # ── 3. Gather GGUF file sizes ────────────────────────────────────
     emb_size = _file_size(cfg.embedding.path)
     model_sizes = [(m.name, _file_size(m.path)) for m in cfg.models]
+
+    # Hash every blob up front so the digests are in the header. The copies
+    # below re-hash as they write and compare, which is what actually catches
+    # a source model changing underneath a long build.
+    print("  Hashing blobs (SHA-256) …")
+    blob_digests: dict[str, str] = {}
+    blob_digests[_dig_key(cfg.embedding.name, emb_size)] = _hash_file(
+        cfg.embedding.path
+    )
+    for mcfg, (_, msize) in zip(cfg.models, model_sizes):
+        blob_digests[_dig_key(mcfg.name, msize)] = _hash_file(mcfg.path)
 
     # ── 4. Plan layout ───────────────────────────────────────────────
     # We don't know the exact JSON header size yet because it contains
@@ -385,6 +426,7 @@ def build(
 
     def _compute_layout(
         estimated_header: int,
+        blob_digests: dict[str, str],
     ) -> tuple[AsmbHeader, int]:
         cursor = align_to_page(PREAMBLE_SIZE + estimated_header)
 
@@ -394,17 +436,22 @@ def build(
             size=emb_size,
             confidence_threshold=cfg.embedding.confidence_threshold,
             fallback_model=cfg.embedding.fallback_model,
+            sha256=blob_digests.get(_dig_key(cfg.embedding.name, emb_size), ""),
         )
         cursor = align_to_page(cursor + emb_size)
 
         model_entries: list[ModelEntry] = []
         for mcfg, (_, msize) in zip(cfg.models, model_sizes):
+            vecs = anchor_embs.get(mcfg.name, [])
+            anchors_b64, anchor_dim = encode_anchors_with_dim(vecs)
             entry = ModelEntry(
                 name=mcfg.name,
                 offset=cursor,
                 size=msize,
                 anchors=mcfg.anchors,
-                anchor_embeddings=anchor_embs.get(mcfg.name, []),
+                anchor_embeddings_b64=anchors_b64,
+                anchor_dim=anchor_dim,
+                sha256=blob_digests.get(_dig_key(mcfg.name, msize), ""),
             )
             model_entries.append(entry)
             cursor = align_to_page(cursor + msize)
@@ -429,18 +476,18 @@ def build(
         return h.embedding.offset + h.embedding.size
 
     # First pass with generous estimate.
-    header, total_size = _compute_layout(estimated_header=8192)
+    header, total_size = _compute_layout(8192, blob_digests)
     json_blob = header.to_json_bytes()
 
     # Re-run with the real header length to fix offsets.
-    header, total_size = _compute_layout(estimated_header=len(json_blob) + 256)
+    header, total_size = _compute_layout(len(json_blob) + 256, blob_digests)
     json_blob = header.to_json_bytes()
 
     # Iterate to a fixed point. The offsets depend on the header length and
     # the header length depends on the offsets (it stores them), so a single
     # "final" pass is only correct if it happens to converge.
     for _ in range(8):
-        header, total_size = _compute_layout(estimated_header=len(json_blob))
+        header, total_size = _compute_layout(len(json_blob), blob_digests)
         blob = header.to_json_bytes()
         if blob == json_blob:
             break
@@ -494,13 +541,19 @@ def build(
 
             # Embedding GGUF
             print(f"  Writing {cfg.embedding.name} @ offset {header.embedding.offset:#x}")
-            _copy_file(cfg.embedding.path, out, emb_size, cfg.embedding.name)
+            _copy_file(
+                cfg.embedding.path, out, emb_size, cfg.embedding.name,
+                expect_sha256=header.embedding.sha256,
+            )
 
             # Execution models
             for mcfg, entry in zip(cfg.models, header.models):
                 _pad_to(out, entry.offset)
                 print(f"  Writing {entry.name} @ offset {entry.offset:#x}")
-                _copy_file(mcfg.path, out, entry.size, entry.name)
+                _copy_file(
+                    mcfg.path, out, entry.size, entry.name,
+                    expect_sha256=entry.sha256,
+                )
 
             out.flush()
             os.fsync(out.fileno())
@@ -578,20 +631,35 @@ def _pad_to(fh, target_offset: int) -> None:
         fh.write(b"\x00" * gap)
 
 
-def _copy_file(src: pathlib.Path, dst, expected: int, name: str) -> None:
-    """Stream *src* into *dst*, verifying the byte count matches *expected*.
+def _copy_file(
+    src: pathlib.Path,
+    dst,
+    expected: int,
+    name: str,
+    *,
+    expect_sha256: str = "",
+) -> None:
+    """Stream *src* into *dst*, verifying size and digest against expectations.
 
     A model that is truncated, replaced, or still downloading between the
     ``stat()`` and the copy would otherwise produce a quietly corrupt
     archive.
+
+    The size check alone does not catch a source that changed *content*
+    without changing length -- a partially re-downloaded file, or a sync
+    tool rewriting the same bytes. When *expect_sha256* is given the bytes
+    are hashed on the way through and compared, for free, since they are
+    already in hand.
     """
     written = 0
+    digest = hashlib.sha256()
     with open(src, "rb") as fh:
         while True:
             chunk = fh.read(_COPY_BUF)
             if not chunk:
                 break
             dst.write(chunk)
+            digest.update(chunk)
             written += len(chunk)
 
     if written != expected:
@@ -599,3 +667,12 @@ def _copy_file(src: pathlib.Path, dst, expected: int, name: str) -> None:
             f"'{name}' changed while building: expected {expected:,} bytes, "
             f"copied {written:,}. Re-run the build."
         )
+
+    if expect_sha256:
+        actual = digest.hexdigest()
+        if actual != expect_sha256:
+            raise BuildError(
+                f"'{name}' changed while building: expected SHA-256 "
+                f"{expect_sha256}, copied bytes hash to {actual}. Re-run the "
+                f"build."
+            )

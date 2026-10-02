@@ -55,6 +55,13 @@ FALLBACK_CONTEXT = 2048
 MIN_CONTEXT = 512
 MAX_CONTEXT = 1 << 20
 
+# How many models may be resident in RAM at once. Past this the least recently
+# used is evicted; its staging file is kept, so returning to a model costs no
+# disk copy. Deliberately generous: each resident model is a full set of
+# weights, so the real ceiling is usually the machine's memory rather than this
+# number. The server lowers it from its settings.
+DEFAULT_MAX_LOADED_MODELS = 8
+
 # Fraction of the window at which a conversation is summarised, and the share
 # of the window the replacement summary plus recent turns may occupy.
 # Triggering late would leave no room to fit the summary itself.
@@ -306,6 +313,113 @@ def _stage_blob(name: str, data: memoryview | bytes) -> Path:
     return path
 
 
+#: Identifies the archive a staged blob was cut from. Offset and size alone
+#: are not unique: two different archives loaded in one server can easily hold
+#: a model at the same offset with the same length. The fingerprint includes
+#: the mtime so an edited archive never reuses the old bytes.
+_ArchiveId = tuple[str, int, int]
+
+#: A staged blob: which archive, and which region of it.
+_StagedKey = tuple[_ArchiveId, int, int]
+
+#: Staged blobs kept for reuse, keyed by _StagedKey. Ordered oldest-first, so
+#: the entry to give up disk space for is the first. Linux never populates
+#: this: there the blob is an anonymous memfd and never reaches the
+#: filesystem, so there is nothing to reuse and nothing to spend.
+_STAGED_BLOBS: dict[_StagedKey, Path] = {}
+
+#: Bytes currently held by :data:`_STAGED_BLOBS`. Bounds the cache against the
+#: one failure mode of keeping files around: filling the volume.
+_STAGED_BYTES = 0
+
+#: Evict the least recently used staged blobs past this many bytes. None, the
+#: default, means keep them until the archive closes. Set it when the staging
+#: volume is too small to hold a second copy of the archive.
+STAGED_CACHE_MAX_BYTES: Optional[int] = None
+
+_STAGED_LOCK = threading.Lock()
+
+
+def _has_memfd() -> bool:
+    """Whether blobs can be handed to llama.cpp without touching the disk."""
+    return sys.platform == "linux" and hasattr(os, "memfd_create")
+
+
+def staged_cache_bytes() -> int:
+    """Bytes currently held by staged blobs kept for reuse."""
+    with _STAGED_LOCK:
+        return _STAGED_BYTES
+
+
+def _remember_staged(key: _StagedKey, path: Path) -> None:
+    """Record *path* as the reusable staging file for *key*."""
+    global _STAGED_BYTES
+    with _STAGED_LOCK:
+        stale = _STAGED_BLOBS.pop(key, None)
+        if stale is not None and stale != path:
+            _evict_paths = [stale]
+        else:
+            _evict_paths = []
+        _STAGED_BLOBS[key] = path
+        try:
+            _STAGED_BYTES += path.stat().st_size
+        except OSError:
+            pass
+    for victim in _evict_paths:
+        _unstage_blob(victim)
+
+
+def _forget_staged(key: _StagedKey) -> Optional[Path]:
+    """Drop *key* from the reuse cache and return the path it held."""
+    global _STAGED_BYTES
+    with _STAGED_LOCK:
+        path = _STAGED_BLOBS.pop(key, None)
+        if path is not None:
+            try:
+                _STAGED_BYTES -= path.stat().st_size
+            except OSError:
+                pass
+        return path
+
+
+def _evict_staged_to_fit(incoming: int) -> None:
+    """Free staged blobs until *incoming* more bytes fit in the cache.
+
+    Oldest first. Never evicts on Linux, where there is nothing cached.
+    """
+    global _STAGED_BYTES
+    limit = STAGED_CACHE_MAX_BYTES
+    if limit is None:
+        return
+    with _STAGED_LOCK:
+        victims: list[Path] = []
+        while _STAGED_BYTES + incoming > limit and _STAGED_BLOBS:
+            key, victim = next(iter(_STAGED_BLOBS.items()))
+            del _STAGED_BLOBS[key]
+            try:
+                _STAGED_BYTES -= victim.stat().st_size
+            except OSError:
+                pass
+            victims.append(victim)
+    for victim in victims:
+        _unstage_blob(victim)
+
+
+def clear_staged_cache(archive: Optional[_ArchiveId] = None) -> None:
+    """Remove staged blobs kept for reuse.
+
+    With *archive*, only that archive's blobs. Without it, all of them. Called
+    when an archive closes; leaving the files behind would keep a second copy
+    of every model on the staging volume for as long as the process ran.
+    """
+    with _STAGED_LOCK:
+        keys = [k for k in _STAGED_BLOBS if archive is None or k[0] == archive]
+    for key in keys:
+        path = _forget_staged(key)
+        if path is not None:
+            _unstage_blob(path)
+
+
 def _unstage_blob(path: Path) -> None:
     """Remove a staged blob, tolerating a platform that still holds it open.
 
@@ -341,10 +455,107 @@ def _describe_load_failure(exc: Exception) -> str:
     return f"llama.cpp could not load the model ({detail})"
 
 
-class _ModelSlot:
-    """Holds a loaded ``llama_cpp.Llama`` instance + its metadata."""
+# ─────────────────────────────────────────────────────────────────────
+# Backend seam
+# ─────────────────────────────────────────────────────────────────────
 
-    __slots__ = ("name", "llama", "offset", "size")
+class Backend:
+    """The six operations Assembly needs from an inference runtime.
+
+    Everything Assembly does to a model goes through this interface, so the
+    llama.cpp binding is a detail rather than a dependency of the router, the
+    archive layout and the server. Two reasons that matters: a test can supply
+    a fake without a multi-gigabyte GGUF, and a second runtime can be dropped
+    in without touching the code above it.
+
+    Implementations must be safe to call from more than one thread. A model
+    returned by :meth:`load` is owned by the caller and released with
+    :meth:`release`.
+    """
+
+    def load(self, path: str, *, embedding: bool = False,
+             n_ctx: int = 0, n_gpu_layers: int = 0,
+             **kwargs: Any) -> Any:
+        """Return a loaded model reading from the file at *path*.
+
+        *kwargs* carries pass-through llama.cpp options (n_threads, n_batch,
+        flash_attn and the like) so the constructor's ``**llama_kwargs``
+        reach llama.cpp instead of being dropped on the floor here.
+        """
+        raise NotImplementedError
+
+    def embed(self, model: Any, text: str) -> Any:
+        """Return the embedding vector for *text*."""
+        raise NotImplementedError
+
+    def chat_completion(self, model: Any, messages: list[dict[str, Any]],
+                        **kwargs: Any) -> Any:
+        """Run a chat completion over *messages*."""
+        raise NotImplementedError
+
+    def completion(self, model: Any, prompt: str, **kwargs: Any) -> Any:
+        """Run a raw completion over *prompt*."""
+        raise NotImplementedError
+
+    def tokenize(self, model: Any, text: str, **kwargs: Any) -> list[int]:
+        """Return the token ids for *text*."""
+        raise NotImplementedError
+
+    def release(self, model: Any) -> None:
+        """Drop *model* and everything it holds. Must tolerate a failure."""
+        raise NotImplementedError
+
+
+class LlamaCppBackend(Backend):
+    """The production backend, backed by ``llama_cpp``.
+
+    ``llama_cpp.Llama`` is imported lazily in :meth:`load`, so importing
+    Assembly — to read a header, or to answer ``assembly --help`` — does not
+    pull in a compiled extension the caller may not have installed.
+    """
+
+    def __init__(self, llm_class: Any = None) -> None:
+        self._llm_class = llm_class
+
+    def load(self, path: str, *, embedding: bool = False,
+             n_ctx: int = 0, n_gpu_layers: int = 0,
+             **kwargs: Any) -> Any:
+        if self._llm_class is None:
+            from llama_cpp import Llama
+            self._llm_class = Llama
+        return self._llm_class(
+            model_path=path,
+            embedding=embedding,
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,
+            **kwargs,
+        )
+
+    def embed(self, model: Any, text: str) -> Any:
+        return model.embed(text)
+
+    def chat_completion(self, model: Any, messages: list[dict[str, Any]],
+                        **kwargs: Any) -> Any:
+        return model.create_chat_completion(messages=messages, **kwargs)
+
+    def completion(self, model: Any, prompt: str, **kwargs: Any) -> Any:
+        return model.create_completion(prompt=prompt, **kwargs)
+
+    def tokenize(self, model: Any, text: str, **kwargs: Any) -> list[int]:
+        return model.tokenize(text.encode("utf-8"), **kwargs)
+
+    def release(self, model: Any) -> None:
+        try:
+            del model
+        except Exception:
+            pass
+
+
+class _ModelSlot:
+    """A model resident in RAM, plus what is needed to load it again."""
+
+    __slots__ = ("name", "llama", "offset", "size", "staged")
 
     def __init__(
         self,
@@ -352,11 +563,17 @@ class _ModelSlot:
         llama: Any,
         offset: int,
         size: int,
+        staged: Optional[Path] = None,
     ) -> None:
         self.name = name
         self.llama = llama
         self.offset = offset
         self.size = size
+        #: The staging file backing this model, kept so a later load of the
+        #: same model can reuse it rather than copying the blob again. None on
+        #: Linux, where the blob is handed over as an anonymous memfd and
+        #: never touches the filesystem.
+        self.staged = staged
 
 
 class AssemblyLlama:
@@ -389,11 +606,11 @@ class AssemblyLlama:
         n_gpu_layers: int = 0,
         verbose: bool = False,
         temp_dir: Optional[str | Path] = None,
+        max_loaded_models: Optional[int] = None,
+        backend: Optional[Backend] = None,
         **llama_kwargs: Any,
     ) -> None:
-        from llama_cpp import Llama
-
-        self._Llama = Llama
+        self._backend = backend if backend is not None else LlamaCppBackend()
         self._asmb_path = Path(asmb_path).expanduser().resolve()
         # Set from the archive in _setup(); there is deliberately no way to
         # override it, see _resolve_context_window.
@@ -402,6 +619,20 @@ class AssemblyLlama:
         self._n_gpu_layers = n_gpu_layers
         self._verbose = verbose
         self._llama_kwargs = llama_kwargs
+        #: How many models may sit in RAM at once. Beyond this the least
+        #: recently used is evicted; its staging file survives, so coming back
+        #: to it costs no disk copy.
+        if max_loaded_models is None:
+            max_loaded_models = DEFAULT_MAX_LOADED_MODELS
+        elif max_loaded_models < 1:
+            # `or` would quietly turn 0 into the default, and a negative cap
+            # would make the eviction loop unload every model it sees.
+            raise ValueError(
+                f"max_loaded_models must be at least 1, got {max_loaded_models}"
+            )
+        self._max_loaded_models = max_loaded_models
+        self._archive_mtime_ns = 0
+        self._archive_size = 0
 
         # Must happen before _setup() stages its first blob, and before
         # close() can run, so a bad --temp-dir is a clean startup error.
@@ -418,6 +649,15 @@ class AssemblyLlama:
         self._embedding_llama: Any = None
         self._model_cache: dict[str, _ModelSlot] = {}
         self._active_slot: Optional[_ModelSlot] = None
+        #: In-flight request count per model. Kept apart from _lock so a
+        #: long generation does not block the bookkeeping that decides whether
+        #: a model may be unloaded.
+        self._in_use_count: dict[int, int] = {}
+        self._in_use_lock = threading.Lock()
+        #: Monotonic clock for LRU order, so two loads of the same size still
+        #: have a deterministic order.
+        self._use_clock = 0
+        self._last_used: dict[str, int] = {}
         self._last_summarized = False
         self._token_cache: dict[str, int] = {}
         self._last_prompt_tokens = 0
@@ -434,7 +674,12 @@ class AssemblyLlama:
         """Open the archive, parse it, and load the router embedding model."""
         # ── Open and mmap the archive ────────────────────────────────
         self._fd = os.open(str(self._asmb_path), os.O_RDONLY)
-        file_size = os.fstat(self._fd).st_size
+        stat = os.fstat(self._fd)
+        file_size = stat.st_size
+        # Fingerprint the archive so a staged blob from an older copy of this
+        # file is never mistaken for one cut from the current bytes.
+        self._archive_mtime_ns = stat.st_mtime_ns
+        self._archive_size = file_size
         if file_size < PREAMBLE_SIZE:
             raise InvalidArchiveError(
                 f"{self._asmb_path.name} is too small to be an .asmb archive "
@@ -590,9 +835,11 @@ class AssemblyLlama:
     ) -> Any:
         """Load a ``llama_cpp.Llama`` from the mmap'd .asmb region.
 
-        llama.cpp needs a filesystem path, so the blob is staged via
-        :func:`_memfd_model` (anonymous in-memory fd on Linux, private temp
-        file elsewhere) and removed as soon as llama.cpp has mapped it.
+        llama.cpp needs a filesystem path. On Linux the blob is handed over as
+        an anonymous in-memory fd, which costs nothing to hold and so is
+        created fresh each time. Everywhere else it is staged to a real file,
+        and that copy is kept so loading the same model again is instant
+        rather than another multi-gigabyte write.
         """
         if self._mm is None:
             raise InvalidArchiveError("archive is not open")
@@ -626,21 +873,91 @@ class AssemblyLlama:
             )
 
         try:
-            with _memfd_model(name, model_view) as model_path:
-                return self._Llama(
-                    model_path=model_path,
-                    embedding=embedding,
-                    n_ctx=n_ctx or self._n_ctx,
-                    n_gpu_layers=self._n_gpu_layers,
-                    verbose=False,
-                    **self._llama_kwargs,
-                )
+            if _has_memfd():
+                with _memfd_model(name, model_view) as model_path:
+                    return self._backend.load(
+                        model_path,
+                        embedding=embedding,
+                        n_ctx=n_ctx or self._n_ctx,
+                        n_gpu_layers=self._n_gpu_layers,
+                        **self._llama_kwargs,
+                    )
+            return self._load_llama_from_staging(
+                name, model_view, offset, size, embedding, n_ctx
+            )
         finally:
-            # Release the mmap export explicitly. If Llama() raised, the
+            # Release the mmap export explicitly. If the backend raised, the
             # traceback keeps this frame alive, and an outstanding export
             # would make mmap.close() raise BufferError and skip the
             # os.close() below.
             model_view.release()
+
+    def _load_llama_from_staging(
+        self,
+        name: str,
+        model_view: memoryview,
+        offset: int,
+        size: int,
+        embedding: bool = False,
+        n_ctx: Optional[int] = None,
+    ) -> Any:
+        """Load a model from a staging file, reusing an earlier copy if we have one."""
+        key = self._staged_key(offset, size)
+        staged = self._reuse_staged(key, size)
+        if staged is None:
+            _evict_staged_to_fit(size)
+            staged = _stage_blob(name, model_view)
+            try:
+                _remember_staged(key, staged)
+            except OSError:
+                _unstage_blob(staged)
+                raise
+        try:
+            return self._backend.load(
+                str(staged),
+                embedding=embedding,
+                n_ctx=n_ctx or self._n_ctx,
+                n_gpu_layers=self._n_gpu_layers,
+                **self._llama_kwargs,
+            )
+        except Exception:
+            # A staging file we cannot load from is worse than none: the next
+            # attempt would reuse it and fail the same way. Forget it.
+            self._forget_staged_path(key)
+            raise
+
+    def _staged_key(self, offset: int, size: int) -> _StagedKey:
+        """Identify a blob within the archive currently open."""
+        return (
+            (str(self._asmb_path), self._archive_mtime_ns, self._archive_size),
+            offset,
+            size,
+        )
+
+    def _reuse_staged(self, key: _StagedKey, size: int) -> Optional[Path]:
+        """Return a usable staging file for *key*, or None to stage a new one."""
+        with _STAGED_LOCK:
+            path = _STAGED_BLOBS.get(key)
+            if path is None:
+                return None
+            try:
+                # A truncated or swapped file would load as a corrupt model.
+                if path.stat().st_size != size:
+                    del _STAGED_BLOBS[key]
+                    return None
+            except OSError:
+                del _STAGED_BLOBS[key]
+                return None
+            # Re-insert so this is the most recently used entry, not the next
+            # one evicted when the cache is over its byte limit.
+            del _STAGED_BLOBS[key]
+            _STAGED_BLOBS[key] = path
+            return path
+
+    def _forget_staged_path(self, key: _StagedKey) -> None:
+        path = _forget_staged(key)
+        if path is not None:
+            _unstage_blob(path)
 
     def _ensure_model(self, route: RouteResult) -> _ModelSlot:
         """Ensure the execution model for *route* is loaded and cached.
@@ -652,9 +969,11 @@ class AssemblyLlama:
             if route.model_name in self._model_cache:
                 slot = self._model_cache[route.model_name]
                 self._active_slot = slot
+                self._last_used[route.model_name] = self._tick()
                 return slot
 
             entry = self._header.models[route.model_index]
+            self._evict_if_needed(entry.size)
             self._log(
                 f"Loading execution model '{entry.name}' "
                 f"({entry.size / 1e6:.1f} MB, offset {entry.offset:#x})"
@@ -683,10 +1002,120 @@ class AssemblyLlama:
                 llama=llm,
                 offset=entry.offset,
                 size=entry.size,
+                staged=self._staged_for(entry.offset, entry.size),
             )
             self._model_cache[entry.name] = slot
             self._active_slot = slot
+            self._last_used[entry.name] = self._tick()
             return slot
+
+    def _tick(self) -> int:
+        self._use_clock += 1
+        return self._use_clock
+
+    # ------------------------------------------------------------------
+    # Resident-model cache
+    # ------------------------------------------------------------------
+
+    def _staged_for(self, offset: int, size: int) -> Optional[Path]:
+        """The staging file for this blob, if one is being kept for reuse."""
+        key = self._staged_key(offset, size)
+        with _STAGED_LOCK:
+            return _STAGED_BLOBS.get(key)
+
+    def _in_use(self, slot: _ModelSlot) -> bool:
+        """Whether a request is currently running on *slot*.
+
+        Unloading a model out from under a streaming response would truncate
+        the answer mid-sentence, so an in-flight slot is never evicted.
+        """
+        with self._in_use_lock:
+            return self._in_use_count.get(id(slot.llama), 0) > 0
+
+    def _acquire(self, slot: _ModelSlot) -> None:
+        with self._in_use_lock:
+            self._in_use_count[id(slot.llama)] = (
+                self._in_use_count.get(id(slot.llama), 0) + 1
+            )
+
+    def _release(self, slot: _ModelSlot) -> None:
+        with self._in_use_lock:
+            key = id(slot.llama)
+            remaining = self._in_use_count.get(key, 0) - 1
+            if remaining > 0:
+                self._in_use_count[key] = remaining
+            else:
+                self._in_use_count.pop(key, None)
+
+    def _guard_stream(self, slot: _ModelSlot, stream: Any) -> Any:
+        """Keep *slot* marked busy for as long as *stream* is being consumed.
+
+        A streaming response is a generator, so the lock around the call only
+        covers its creation — the lock is gone by the time the caller pulls the
+        first token. Without this the model would look idle for the whole
+        stream and eviction could pull it out mid-answer.
+        """
+        if not hasattr(stream, "__iter__") or isinstance(stream, (dict, list, str, bytes)):
+            return stream
+        self._acquire(slot)
+
+        def _iterate() -> Iterator[Any]:
+            try:
+                yield from stream
+            finally:
+                # Runs on exhaustion, on exception, and on close(), which is
+                # what a client disconnect looks like from here.
+                self._release(slot)
+
+        return _iterate()
+
+    def _evict_if_needed(self, incoming: int = 0) -> None:
+        """Free RAM until there is room for one more model.
+
+        Least recently used first, and never a model with a request running on
+        it. The staging file is left alone: that is the whole point of keeping
+        it, so a later request for this model is a memory-map rather than
+        another multi-gigabyte copy.
+
+        Caller must hold :attr:`_lock`.
+        """
+        while len(self._model_cache) >= self._max_loaded_models:
+            victim = self._least_recently_used()
+            if victim is None:
+                # Everything resident is mid-request. Refusing here is correct:
+                # evicting anyway would truncate somebody's answer, and
+                # exceeding the cap beats corrupting a response.
+                self._log(
+                    f"all {len(self._model_cache)} resident models are busy; "
+                    f"loading beyond max_loaded_models={self._max_loaded_models} "
+                    f"until one finishes"
+                )
+                return
+            self._unload(victim)
+
+    def _least_recently_used(self) -> Optional[_ModelSlot]:
+        """The resident model to give up first, or None if none are free."""
+        candidates = [s for s in self._model_cache.values() if not self._in_use(s)]
+        if not candidates:
+            return None
+        victim = min(
+            candidates,
+            key=lambda s: (self._last_used.get(s.name, 0), s.size),
+        )
+        return victim
+
+    def _unload(self, slot: _ModelSlot) -> None:
+        """Drop *slot* from RAM, keeping its staging file for reuse."""
+        self._model_cache.pop(slot.name, None)
+        if self._active_slot is slot:
+            self._active_slot = None
+        self._last_used.pop(slot.name, None)
+        try:
+            self._backend.release(slot.llama)
+        except Exception:
+            pass
+        slot.llama = None
+        self._log(f"Unloaded '{slot.name}' (staging copy kept for reuse)")
 
     # ------------------------------------------------------------------
     # Routing
@@ -694,7 +1123,7 @@ class AssemblyLlama:
 
     def _embed_prompt(self, text: str) -> np.ndarray:
         """Compute the embedding vector for *text* using the router model."""
-        emb = self._embedding_llama.embed(text)
+        emb = self._backend.embed(self._embedding_llama, text)
         if not emb:
             raise RuntimeError("router model returned an empty embedding")
         if isinstance(emb[0], list):
@@ -744,7 +1173,7 @@ class AssemblyLlama:
         if self._persona:
             try:
                 msgs = self._prepare_messages([{"role": "user", "content": prompt}])
-                resp = slot.llama.create_chat_completion(messages=msgs, **kwargs)
+                resp = self._backend.chat_completion(slot.llama, msgs, **kwargs)
                 # Ensure choices have both 'text' and 'message'
                 choices = resp.get("choices", [])
                 if choices:
@@ -761,13 +1190,13 @@ class AssemblyLlama:
                 )
 
         with self._lock:
-            return slot.llama(prompt, **kwargs)
+            return self._backend.completion(slot.llama, prompt, **kwargs)
 
     def create_completion(self, prompt: str, **kwargs: Any) -> Any:
         """``Llama.create_completion`` equivalent with automatic routing."""
         slot = self._route_and_load(prompt)
         with self._lock:
-            return slot.llama.create_completion(prompt, **kwargs)
+            return self._backend.completion(slot.llama, prompt, **kwargs)
 
     # ------------------------------------------------------------------
     # Keeping a conversation inside the context window
@@ -793,8 +1222,9 @@ class AssemblyLlama:
             try:
                 with self._lock:
                     count = len(
-                        self._active_slot.llama.tokenize(
-                            text.encode("utf-8"), add_bos=False, special=False
+                        self._backend.tokenize(
+                            self._active_slot.llama, text,
+                            add_bos=False, special=False
                         )
                     )
             except Exception:
@@ -867,7 +1297,8 @@ class AssemblyLlama:
                 "content": f"Summarise this conversation:\n\n{transcript}",
             },
         ]
-        result = slot.llama.create_chat_completion(
+        result = self._backend.chat_completion(
+            slot.llama,
             prompt,
             max_tokens=max_output,
             temperature=0.2,
@@ -1074,7 +1505,20 @@ class AssemblyLlama:
         # which is the only figure worth reporting to a caller.
         self._last_prompt_tokens = self._conversation_tokens(effective_messages)
         with self._lock:
-            return slot.llama.create_chat_completion(effective_messages, **kwargs)
+            self._acquire(slot)
+            try:
+                result = self._backend.chat_completion(
+                    slot.llama, effective_messages, **kwargs
+                )
+            except BaseException:
+                self._release(slot)
+                raise
+        if kwargs.get("stream"):
+            # The lock is released above; the stream keeps the slot pinned
+            # instead. See _guard_stream.
+            return self._guard_stream(slot, result)
+        self._release(slot)
+        return result
 
     def _route_and_load(self, text: str) -> _ModelSlot:
         """Route *text* and return the loaded model slot that will answer."""
@@ -1123,18 +1567,23 @@ class AssemblyLlama:
     def close(self) -> None:
         """Release all resources. Safe to call more than once."""
         # Every step is independent: one failure must not strand the fd.
-        for name in list(self._model_cache):
-            slot = self._model_cache.pop(name, None)
-            if slot is not None:
-                try:
-                    del slot.llama
-                except Exception:
-                    pass
-        self._active_slot = None
+        with self._lock:
+            for name in list(self._model_cache):
+                slot = self._model_cache.pop(name, None)
+                if slot is not None:
+                    try:
+                        self._backend.release(slot.llama)
+                    except Exception:
+                        pass
+                    slot.llama = None
+            self._active_slot = None
+            self._last_used.clear()
+
+        self._in_use_count.clear()
 
         if self._embedding_llama is not None:
             try:
-                del self._embedding_llama
+                self._backend.release(self._embedding_llama)
             except Exception:
                 pass
             self._embedding_llama = None
@@ -1155,6 +1604,13 @@ class AssemblyLlama:
                 os.close(fd)
             except OSError:
                 pass
+
+        # Staged copies belong to this archive alone; another archive loaded in
+        # the same server keeps its own.
+        clear_staged_cache(
+            (str(self._asmb_path), self._archive_mtime_ns, self._archive_size)
+            if self._archive_mtime_ns else None
+        )
 
     def __enter__(self) -> AssemblyLlama:
         return self

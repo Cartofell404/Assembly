@@ -8,6 +8,7 @@ validation) without requiring actual GGUF model files or llama-cpp-python.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import pathlib
@@ -20,6 +21,39 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from assembly import ui  # noqa: E402
+
+class FakeBackend:
+    """A :class:`assembly.wrapper.Backend` that just forwards to a mock model.
+
+    Tests can stub a loaded model however they like — ``create_chat_completion``,
+    ``tokenize`` and the rest — and this passes those stubs through, so the
+    routing, context and summarisation logic above the seam is what is under
+    test rather than llama.cpp.
+    """
+
+    def __init__(self) -> None:
+        self.loaded: list[str] = []
+        self.released: list[Any] = []
+
+    def load(self, path, *, embedding=False, n_ctx=0, n_gpu_layers=0):
+        self.loaded.append(path)
+        return path
+
+    def embed(self, model, text):
+        return model.embed(text)
+
+    def chat_completion(self, model, messages, **kwargs):
+        return model.create_chat_completion(messages=messages, **kwargs)
+
+    def completion(self, model, prompt, **kwargs):
+        return model.create_completion(prompt=prompt, **kwargs)
+
+    def tokenize(self, model, text, **kwargs):
+        return model.tokenize(text.encode("utf-8"), **kwargs)
+
+    def release(self, model):
+        self.released.append(model)
+
 
 # ── Header tests ─────────────────────────────────────────────────────
 
@@ -89,15 +123,15 @@ class TestAsmbHeader:
                 confidence_threshold=0.8, fallback_model="m2",
             ),
             models=[
-                ModelEntry(
-                    name="m1", offset=8192, size=2000,
+                ModelEntry.with_vectors(
+                    "m1", [[0.1, 0.2], [0.3, 0.4]],
+                    offset=8192, size=2000,
                     anchors=["code", "debug"],
-                    anchor_embeddings=[[0.1, 0.2], [0.3, 0.4]],
                 ),
-                ModelEntry(
-                    name="m2", offset=16384, size=3000,
+                ModelEntry.with_vectors(
+                    "m2", [[0.5, 0.6]],
+                    offset=16384, size=3000,
                     anchors=["story"],
-                    anchor_embeddings=[[0.5, 0.6]],
                 ),
             ],
         )
@@ -114,7 +148,12 @@ class TestAsmbHeader:
         assert h2.embedding.fallback_model == "m2"
         assert len(h2.models) == 2
         assert h2.models[0].anchors == ["code", "debug"]
-        assert h2.models[1].anchor_embeddings == [[0.5, 0.6]]
+        # Stored as float32, so compare at float32 precision rather than
+        # expecting the original float64 literals back exactly.
+        got = h2.models[1].anchor_vectors()
+        assert len(got) == 1
+        assert got[0] == pytest.approx([0.5, 0.6], abs=1e-7)
+        assert h2.models[0].anchor_dim == 2
 
     def test_full_binary_roundtrip(self):
         h = self._make_header()
@@ -481,21 +520,15 @@ class TestRouter:
                 fallback_model=fallback,
             ),
             models=[
-                ModelEntry(
-                    name="coder",
-                    offset=0,
-                    size=0,
-                    anchors=["code"],
-                    # Normalised direction: roughly [1, 0]
-                    anchor_embeddings=[[1.0, 0.0]],
+                # Normalised directions: coder roughly [1, 0],
+                # writer roughly [0, 1].
+                ModelEntry.with_vectors(
+                    "coder", [[1.0, 0.0]],
+                    offset=0, size=0, anchors=["code"],
                 ),
-                ModelEntry(
-                    name="writer",
-                    offset=0,
-                    size=0,
-                    anchors=["story"],
-                    # Normalised direction: roughly [0, 1]
-                    anchor_embeddings=[[0.0, 1.0]],
+                ModelEntry.with_vectors(
+                    "writer", [[0.0, 1.0]],
+                    offset=0, size=0, anchors=["story"],
                 ),
             ],
         )
@@ -1068,12 +1101,12 @@ class TestPackerIntegrity:
         real_copy = packer._copy_file
         calls = {"n": 0}
 
-        def shrinking_copy(src, dst, expected, name):
+        def shrinking_copy(src, dst, expected, name, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 # Simulate the file being replaced by a smaller one mid-build.
                 src.write_bytes(b"\x00" * (expected // 2))
-            return real_copy(src, dst, expected, name)
+            return real_copy(src, dst, expected, name, **kw)
 
         packer._copy_file = shrinking_copy
         try:
@@ -1094,7 +1127,7 @@ class TestPackerIntegrity:
 
         real_copy = packer._copy_file
 
-        def lying_copy(src, dst, expected, name):
+        def lying_copy(src, dst, expected, name, **kw):
             dst.write(b"\x00" * (expected + 16))
             return None
 
@@ -2552,6 +2585,7 @@ class TestConversationSummarization:
         obj._log = lambda *a, **k: None
         obj._last_summarized = False
         obj._token_cache = {}
+        obj._backend = FakeBackend()
         import threading
         obj._lock = threading.Lock()
         return obj
@@ -5248,3 +5282,745 @@ class TestServeTempDirForwarded:
         assert Path_is(seen["temp_dir"], tmp_path), (
             "serve --temp-dir is still dropped before it reaches the server"
         )
+
+
+# ── Resident model cache & staged-blob reuse ──────────────────────────
+
+def _shell(tmp_path, max_loaded=8):
+    """An AssemblyLlama wired up for cache work, without a real archive."""
+    import threading
+    from assembly.wrapper import AssemblyLlama
+
+    obj = AssemblyLlama.__new__(AssemblyLlama)
+    obj._backend = FakeBackend()
+    obj._asmb_path = tmp_path / "mesh.asmb"
+    obj._archive_mtime_ns = 1
+    obj._archive_size = 4096
+    obj._model_cache = {}
+    obj._active_slot = None
+    obj._in_use_count = {}
+    obj._in_use_lock = threading.Lock()
+    obj._use_clock = 0
+    obj._last_used = {}
+    obj._max_loaded_models = max_loaded
+    obj._lock = threading.RLock()
+    obj._token_cache = {}
+    obj._log = lambda *a, **k: None
+    obj._n_ctx = 2048
+    obj._n_gpu_layers = 0
+    obj._embedding_llama = None
+    obj._fd = None
+    obj._mm = None
+    obj._header = None
+    obj._llama_kwargs = {}
+    return obj
+
+
+class TestStagedBlobReuse:
+    """A blob staged for one load is kept so the next load does not re-copy.
+
+    Staging a model is a full multi-gigabyte write. Doing that every time a
+    model is loaded made a busy server spend most of its time copying bytes it
+    had already written.
+    """
+
+    @staticmethod
+    def _use_tmp_staging(monkeypatch, tmp_path):
+        from assembly import wrapper
+
+        monkeypatch.setattr(wrapper, "assembly_temp_dir", lambda: tmp_path)
+        wrapper.clear_staged_cache()
+
+    def test_the_second_load_reuses_the_first_copy(self, tmp_path, monkeypatch):
+        from assembly import wrapper
+
+        self._use_tmp_staging(monkeypatch, tmp_path)
+        obj = _shell(tmp_path)
+        view = memoryview(b"payload")
+
+        first = obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+        second = obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+        assert first == second, "second load staged a fresh copy of the blob"
+        wrapper.clear_staged_cache()
+
+    def test_reuse_survives_the_model_being_unloaded(self, tmp_path, monkeypatch):
+        """Evicting from RAM must not throw away the staged file.
+
+        This is the whole point of the split: unload the model, keep the copy
+        so coming back to it costs a memory-map and nothing else.
+        """
+        from assembly import wrapper
+        from assembly.wrapper import _ModelSlot
+
+        self._use_tmp_staging(monkeypatch, tmp_path)
+        obj = _shell(tmp_path, max_loaded=1)
+        view = memoryview(b"payload")
+
+        first = obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+        obj._unload(_ModelSlot("m", "fake", 0, len(b"payload")))
+        second = obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+
+        assert pathlib.Path(first).is_file(), "unload deleted the staging file"
+        assert first == second
+        wrapper.clear_staged_cache()
+
+    def test_a_different_archive_does_not_reuse_the_blob(self, tmp_path,
+                                                         monkeypatch):
+        """Two archives can hold a model at the same offset and size."""
+        from assembly import wrapper
+
+        self._use_tmp_staging(monkeypatch, tmp_path)
+        obj = _shell(tmp_path)
+        other = _shell(tmp_path)
+        other._archive_mtime_ns = 2
+        view = memoryview(b"payload")
+
+        first = obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+        second = other._load_llama_from_staging("m", view, 0, len(b"payload"))
+        assert first != second
+        wrapper.clear_staged_cache()
+
+    def test_a_truncated_staging_file_is_replaced(self, tmp_path, monkeypatch):
+        """Reusing a half-written file would load as a corrupt model."""
+        from assembly import wrapper
+
+        self._use_tmp_staging(monkeypatch, tmp_path)
+        obj = _shell(tmp_path)
+        view = memoryview(b"payload")
+
+        first = pathlib.Path(
+            obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+        )
+        first.write_bytes(b"truncated")
+        second = pathlib.Path(
+            obj._load_llama_from_staging("m", view, 0, len(b"payload"))
+        )
+        assert second.read_bytes() == b"payload"
+        wrapper.clear_staged_cache()
+
+    def test_closing_an_archive_removes_only_its_own_blobs(self, tmp_path,
+                                                           monkeypatch):
+        from assembly import wrapper
+
+        self._use_tmp_staging(monkeypatch, tmp_path)
+        a = _shell(tmp_path)
+        b = _shell(tmp_path)
+        b._archive_mtime_ns = 2
+        view = memoryview(b"payload")
+
+        kept = pathlib.Path(b._load_llama_from_staging("m", view, 0, 7))
+        gone = pathlib.Path(a._load_llama_from_staging("m", view, 0, 7))
+
+        a.close()
+        assert not gone.exists(), "the closed archive's blob was left behind"
+        assert kept.exists(), "another archive's blob was removed"
+        b.close()
+        assert not kept.exists()
+        wrapper.clear_staged_cache()
+
+    def test_a_byte_limit_evicts_the_least_recently_used_copy(self, tmp_path,
+                                                              monkeypatch):
+        from assembly import wrapper
+
+        self._use_tmp_staging(monkeypatch, tmp_path)
+        monkeypatch.setattr(wrapper, "STAGED_CACHE_MAX_BYTES", 8)
+        obj = _shell(tmp_path)
+
+        old = pathlib.Path(obj._load_llama_from_staging("a", memoryview(b"aaaa"), 0, 4))
+        # Touching 'a' again makes 'b' the older entry.
+        obj._load_llama_from_staging("a", memoryview(b"aaaa"), 0, 4)
+        obj._load_llama_from_staging("b", memoryview(b"bbbb"), 8, 4)
+
+        assert not old.exists(), "the oldest staging copy was not reclaimed"
+        wrapper.clear_staged_cache()
+        monkeypatch.setattr(wrapper, "STAGED_CACHE_MAX_BYTES", None)
+
+
+class TestResidentModelEviction:
+    """Past max_loaded_models, models leave RAM. They used to never leave."""
+
+    @staticmethod
+    def _slot(name, order):
+        from assembly.wrapper import _ModelSlot
+
+        slot = _ModelSlot(name, f"llm-{name}", 0, 1024)
+        return slot, order
+
+    def _populate(self, obj, names):
+        for i, name in enumerate(names):
+            slot, _ = self._slot(name, i)
+            obj._model_cache[name] = slot
+            obj._last_used[name] = obj._tick()
+
+    def test_the_least_recently_used_model_is_dropped(self, tmp_path):
+        obj = _shell(tmp_path, max_loaded=2)
+        self._populate(obj, ["a", "b"])
+        obj._last_used["a"] = 0  # a is now the oldest
+
+        obj._evict_if_needed()
+
+        assert "a" not in obj._model_cache, "the LRU model was kept"
+        assert "b" in obj._model_cache, "the most recent model was dropped"
+
+    def test_eviction_makes_room_for_exactly_one_more(self, tmp_path):
+        """The cap is checked before the new model is added, so it drops one."""
+        obj = _shell(tmp_path, max_loaded=3)
+        self._populate(obj, ["a", "b", "c"])
+
+        obj._evict_if_needed()
+
+        assert len(obj._model_cache) == 2
+
+    def test_nothing_is_dropped_below_the_cap(self, tmp_path):
+        obj = _shell(tmp_path, max_loaded=3)
+        self._populate(obj, ["a", "b"])
+
+        obj._evict_if_needed()
+
+        assert set(obj._model_cache) == {"a", "b"}
+
+    def test_a_busy_model_is_never_unloaded(self, tmp_path):
+        """Unloading under a live request would truncate the answer."""
+        obj = _shell(tmp_path, max_loaded=2)
+        self._populate(obj, ["a", "b"])
+        obj._last_used["a"] = 0
+        obj._acquire(obj._model_cache["a"])
+
+        obj._evict_if_needed()
+
+        assert "a" in obj._model_cache, "a model with a request on it was unloaded"
+        assert "b" not in obj._model_cache, "the idle model was not the one dropped"
+
+    def test_the_cap_is_exceeded_only_when_every_model_is_busy(self, tmp_path):
+        """Correct: over the limit beats truncating somebody's answer."""
+        obj = _shell(tmp_path, max_loaded=1)
+        self._populate(obj, ["a"])
+        obj._acquire(obj._model_cache["a"])
+
+        obj._evict_if_needed()
+
+        assert len(obj._model_cache) == 1
+
+    def test_unloading_releases_the_model(self, tmp_path):
+        from assembly.wrapper import _ModelSlot
+
+        obj = _shell(tmp_path, max_loaded=1)
+        slot = _ModelSlot("a", "llm-a", 0, 1024)
+        obj._model_cache["a"] = slot
+        obj._active_slot = slot
+
+        obj._unload(slot)
+
+        assert obj._model_cache == {}
+        assert obj._active_slot is None
+        assert "llm-a" in obj._backend.released
+
+    def test_releasing_the_last_request_frees_the_model(self, tmp_path):
+        obj = _shell(tmp_path, max_loaded=1)
+        self._populate(obj, ["a"])
+        slot = obj._model_cache["a"]
+
+        obj._acquire(slot)
+        assert obj._in_use(slot)
+        obj._release(slot)
+        assert not obj._in_use(slot)
+
+    def test_close_empties_the_cache(self, tmp_path):
+        obj = _shell(tmp_path)
+        self._populate(obj, ["a", "b"])
+        obj.close()
+        assert obj._model_cache == {}
+
+
+class TestStreamKeepsModelPinned:
+    """A streaming reply must not lose its model half way through.
+
+    A streaming response is a generator: the lock around the call only covers
+    its creation, so by the time the caller reads the first token the model
+    already looks idle.
+    """
+
+    def _obj(self, tmp_path):
+        from assembly.wrapper import _ModelSlot
+
+        obj = _shell(tmp_path)
+        slot = _ModelSlot("a", "llm-a", 0, 1024)
+        obj._model_cache["a"] = slot
+        return obj, slot
+
+    def test_the_model_stays_busy_while_the_stream_is_read(self, tmp_path):
+        obj, slot = self._obj(tmp_path)
+
+        def tokens():
+            yield "a"
+            yield "b"
+
+        guarded = obj._guard_stream(slot, tokens())
+        assert obj._in_use(slot), "released before the stream was consumed"
+
+        next(guarded)
+        assert obj._in_use(slot), "released after one token"
+        list(guarded)
+        assert not obj._in_use(slot), "never released after the stream ended"
+
+    def test_abandoning_the_stream_still_releases(self, tmp_path):
+        """A client that disconnects mid-answer must not pin the model forever."""
+        obj, slot = self._obj(tmp_path)
+
+        def tokens():
+            yield "a"
+            yield "b"
+
+        guarded = obj._guard_stream(slot, tokens())
+        next(guarded)
+        guarded.close()
+        assert not obj._in_use(slot)
+
+    def test_a_non_iterable_result_is_passed_through(self, tmp_path):
+        obj, slot = self._obj(tmp_path)
+        result = {"choices": []}
+        assert obj._guard_stream(slot, result) is result
+        assert not obj._in_use(slot)
+
+
+class TestBackendSeam:
+    """LlamaCppBackend is a thin, complete adapter over llama_cpp.Llama."""
+
+    def _llm(self):
+        from unittest.mock import MagicMock
+
+        m = MagicMock()
+        m.create_chat_completion.return_value = {"ok": True}
+        m.create_completion.return_value = {"raw": True}
+        m.tokenize.return_value = [1, 2, 3]
+        return m
+
+    def test_load_forwards_the_runtime_options(self):
+        from assembly.wrapper import LlamaCppBackend
+
+        backend = LlamaCppBackend(llm_class=self._llm())
+        backend.load("/tmp/m.gguf", embedding=True, n_ctx=4096, n_gpu_layers=12)
+        kwargs = backend._llm_class.call_args.kwargs
+        assert kwargs["model_path"] == "/tmp/m.gguf"
+        assert kwargs["embedding"] is True
+        assert kwargs["n_ctx"] == 4096
+        assert kwargs["n_gpu_layers"] == 12
+
+    def test_chat_and_completion_delegate(self):
+        from assembly.wrapper import LlamaCppBackend
+
+        model = self._llm()
+        backend = LlamaCppBackend(llm_class=self._llm)
+        msgs = [{"role": "user", "content": "hi"}]
+
+        assert backend.chat_completion(model, msgs, temperature=0.2) == {"ok": True}
+        model.create_chat_completion.assert_called_once_with(
+            messages=msgs, temperature=0.2
+        )
+
+        assert backend.completion(model, "raw", stream=False) == {"raw": True}
+        model.create_completion.assert_called_once_with(prompt="raw", stream=False)
+
+    def test_tokenize_encodes_and_forwards_options(self):
+        from assembly.wrapper import LlamaCppBackend
+
+        model = self._llm()
+        backend = LlamaCppBackend(llm_class=self._llm)
+        assert backend.tokenize(model, "abc", add_bos=False) == [1, 2, 3]
+        model.tokenize.assert_called_once_with(b"abc", add_bos=False)
+
+    def test_embed_delegates(self):
+        from assembly.wrapper import LlamaCppBackend
+
+        model = self._llm()
+        model.embed.return_value = [[0.1, 0.2]]
+        backend = LlamaCppBackend(llm_class=self._llm)
+        assert backend.embed(model, "text") == [[0.1, 0.2]]
+
+    def test_release_tolerates_anything(self):
+        from assembly.wrapper import LlamaCppBackend
+
+        backend = LlamaCppBackend(llm_class=self._llm)
+        backend.release(object())  # must not raise
+
+
+class TestMaxLoadedModelsValidation:
+    """A nonsense cap must fail loudly instead of disabling eviction."""
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_a_nonsense_cap_is_rejected(self, bad):
+        from assembly.wrapper import AssemblyLlama
+
+        with pytest.raises(ValueError, match="at least 1"):
+            AssemblyLlama("x.asmb", max_loaded_models=bad)
+
+
+class TestServerPlumbsSubmodelCap:
+    """ModelManager's cap and the wrapper's cap are different things.
+
+    ``max_models`` bounds open archives; ``max_loaded_models`` bounds the
+    models resident inside each one. Both default to 8, but conflating them
+    would mean a nine-model archive silently evicts its way through its own
+    contents.
+    """
+
+    def test_the_cap_reaches_the_wrapper(self, tmp_path, monkeypatch):
+        from assembly import server
+
+        seen = {}
+
+        def fake_llama(**kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(server, "AssemblyLlama", fake_llama)
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        mgr = server.ModelManager(max_loaded_models=3)
+        with pytest.raises(RuntimeError):
+            mgr.load_model(archive, alias="a")
+
+        assert seen["max_loaded_models"] == 3
+
+    def test_the_default_is_eight(self, tmp_path, monkeypatch):
+        from assembly import server
+
+        seen = {}
+
+        def fake_llama(**kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("stop")
+
+        monkeypatch.setattr(server, "AssemblyLlama", fake_llama)
+        archive = tmp_path / "a.asmb"
+        archive.write_bytes(b"x")
+        with pytest.raises(RuntimeError):
+            server.ModelManager().load_model(archive, alias="a")
+        assert seen["max_loaded_models"] == 8
+
+
+class TestAnchorEncoding:
+    """Anchors are float32 and base64, not a nest of JSON decimals."""
+
+    def test_vectors_survive_a_roundtrip(self):
+        from assembly.header import decode_anchors, encode_anchors_with_dim
+
+        vecs = [[0.5, -0.25, 0.125], [1.0, 0.0, 0.0]]
+        blob, dim = encode_anchors_with_dim(vecs)
+
+        assert dim == 3
+        got = decode_anchors(blob, dim)
+        assert len(got) == len(vecs)
+        for g, w in zip(got, vecs):
+            assert g == pytest.approx(w, abs=1e-7)
+
+    def test_an_empty_list_stays_empty(self):
+        from assembly.header import decode_anchors, encode_anchors_with_dim
+
+        blob, dim = encode_anchors_with_dim([])
+        assert blob == "" and dim == 0
+        assert decode_anchors(blob, dim) == []
+
+    def test_ragged_vectors_are_rejected(self):
+        """A silently reshaped matrix would route to the wrong model."""
+        from assembly.header import encode_anchors_with_dim
+
+        with pytest.raises(ValueError, match="ragged"):
+            encode_anchors_with_dim([[1.0, 2.0], [3.0]])
+
+    def test_zero_width_vectors_are_rejected(self):
+        from assembly.header import encode_anchors_with_dim
+
+        with pytest.raises(ValueError, match="zero dimensions"):
+            encode_anchors_with_dim([[]])
+
+    def test_the_encoding_is_much_smaller_than_json(self):
+        """The reason for the change: decimal text was about twice the size."""
+        import json
+
+        from assembly.header import encode_anchors_with_dim
+
+        vecs = [[i / 1024.0 for i in range(1024)]]
+        blob, _ = encode_anchors_with_dim(vecs)
+        as_json = json.dumps(vecs).encode("utf-8")
+
+        assert len(blob) < len(as_json) / 1.5
+
+    def test_values_are_stored_at_float32_precision(self):
+        """float32, not float16: narrowing twice would cost real accuracy."""
+        import struct
+
+        import base64
+
+        from assembly.header import encode_anchors_with_dim
+
+        vec = [0.123456789, -0.987654321]
+        blob, _dim = encode_anchors_with_dim([vec])
+        packed = base64.b64decode(blob)
+
+        stored = struct.unpack(f">{len(vec)}f", packed)[0]
+        assert stored == pytest.approx(vec[0], abs=1e-7)
+        # float16 would have rounded this far more coarsely.
+        assert stored != struct.unpack("<e", struct.pack("<e", vec[0]))[0]
+
+    def test_corrupt_base64_is_reported_clearly(self):
+        from assembly.header import InvalidArchiveError, decode_anchors  # noqa: F401
+
+        with pytest.raises(InvalidArchiveError, match="not valid base64"):
+            decode_anchors("not base64!!", 4)
+
+    def test_a_truncated_payload_is_rejected(self):
+        import base64
+
+        from assembly.header import InvalidArchiveError, decode_anchors
+
+        blob = base64.b64encode(b"\x00" * 6).decode()  # not a multiple of 4
+        with pytest.raises(InvalidArchiveError, match="float32"):
+            decode_anchors(blob, 4)
+
+    def test_a_wrong_dimension_is_rejected(self):
+        from assembly.header import InvalidArchiveError, decode_anchors
+
+        # 8 values claimed to be 3-dim: cannot be reshaped honestly.
+        from assembly.header import encode_anchors_with_dim
+
+        blob, _ = encode_anchors_with_dim([[1.0, 2.0]])
+        with pytest.raises(InvalidArchiveError, match="divisible"):
+            decode_anchors(blob, 3)
+
+    def test_a_zero_dimension_is_rejected(self):
+        from assembly.header import InvalidArchiveError, decode_anchors
+
+        with pytest.raises(InvalidArchiveError, match="dimension"):
+            decode_anchors("AAAA", 0)
+
+    def test_the_dimension_is_recorded_per_model(self):
+        """Different embedders have different widths; no global constant."""
+        from assembly.header import ModelEntry
+
+        a = ModelEntry.with_vectors("a", [[1.0] * 8])
+        b = ModelEntry.with_vectors("b", [[1.0] * 16])
+
+        assert (a.anchor_dim, b.anchor_dim) == (8, 16)
+        assert len(a.anchor_vectors()[0]) == 8
+        assert len(b.anchor_vectors()[0]) == 16
+
+    def test_the_readonly_view_matches_the_vectors(self):
+        from assembly.header import ModelEntry
+
+        entry = ModelEntry.with_vectors("m", [[0.5, 0.25]])
+        assert entry.anchor_embeddings[0] == pytest.approx([0.5, 0.25], abs=1e-7)
+
+
+class TestLegacyAnchorLayout:
+    """An archive written before the binary change must still route.
+
+    Nothing was ever published, but archives build in a few minutes and
+    people do keep them; refusing to read one that is otherwise perfectly
+    good costs nothing to avoid.
+    """
+
+    def _legacy_header(self):
+        return {
+            "assembly_name": "old",
+            "version": 1,
+            "page_size": 4096,
+            "persona": None,
+            "embedding": {
+                "name": "emb", "offset": 4096, "size": 16,
+                "confidence_threshold": 0.8, "fallback_model": None,
+            },
+            "models": [{
+                "name": "m1",
+                "offset": 8192,
+                "size": 16,
+                "anchors": ["code"],
+                "anchor_embeddings": [[1.0, 0.0]],
+            }],
+        }
+
+    def test_nested_float_lists_are_converted_on_read(self):
+        from assembly.header import AsmbHeader
+
+        blob = json.dumps(self._legacy_header()).encode("utf-8")
+        header = AsmbHeader.from_json_bytes(blob)
+
+        entry = header.models[0]
+        assert entry.anchor_dim == 2
+        assert entry.anchor_vectors()[0] == pytest.approx([1.0, 0.0], abs=1e-7)
+        assert entry.anchor_embeddings_b64, "not rewritten in the binary form"
+
+    def test_the_router_still_works_off_a_legacy_archive(self):
+        import numpy as np
+
+        from assembly.header import AsmbHeader
+        from assembly.router import Router
+
+        blob = json.dumps(self._legacy_header()).encode("utf-8")
+        header = AsmbHeader.from_json_bytes(blob)
+        result = Router(header).route(np.array([1.0, 0.0], dtype=np.float32))
+
+        assert result.model_index == 0
+
+    def test_rewriting_produces_the_compact_form(self):
+        """Reading then re-serialising shrinks it, so a rebuild cleans up."""
+        from assembly.header import AsmbHeader
+
+        blob = json.dumps(self._legacy_header()).encode("utf-8")
+        header = AsmbHeader.from_json_bytes(blob)
+
+        rewritten = header.to_json_bytes()
+        assert b"anchor_embeddings_b64" in rewritten
+
+    def test_rewriting_shrinks_a_realistic_anchor_set(self):
+        """A 2-float toy vector is *larger* base64 than JSON.
+
+        The saving comes from vector count and width, so the comparison only
+        means anything at the size an archive actually carries.
+        """
+        from assembly.header import AsmbHeader
+
+        legacy = self._legacy_header()
+        legacy["models"][0]["anchors"] = [f"topic {i}" for i in range(8)]
+        legacy["models"][0]["anchor_embeddings"] = [
+            [0.1234567, -0.2345678, 0.3456789, -0.4567891] for _ in range(8)
+        ]
+        blob = json.dumps(legacy, separators=(",", ":")).encode("utf-8")
+
+        assert len(AsmbHeader.from_json_bytes(blob).to_json_bytes()) < len(blob)
+
+
+class TestBlobChecksums:
+    """Every blob carries the SHA-256 of its own bytes."""
+
+    @staticmethod
+    def _built(tmp_path):
+        from assembly.packer import build
+
+        for name, size in (("emb.gguf", 2000), ("m1.gguf", 3000),
+                           ("m2.gguf", 1500)):
+            (tmp_path / name).write_bytes(b"\xab" * size)
+        cfg = {
+            "assembly_name": "digest",
+            "embedding": {"name": "emb", "path": str(tmp_path / "emb.gguf"),
+                          "confidence_threshold": 0.7, "fallback_model": "m1"},
+            "models": [
+                {"name": "m1", "path": str(tmp_path / "m1.gguf"),
+                 "anchors": ["a"]},
+                {"name": "m2", "path": str(tmp_path / "m2.gguf"),
+                 "anchors": ["b"]},
+            ],
+        }
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps(cfg))
+        out = tmp_path / "built.asmb"
+        build(cfg_path, out, skip_embeddings=True)
+        return out
+
+    def test_digests_are_recorded_and_correct(self, tmp_path):
+        import hashlib
+        import mmap as _mmap
+
+        from assembly.header import read_header
+
+        out = self._built(tmp_path)
+        with open(out, "rb") as fh:
+            with _mmap.mmap(fh.fileno(), 0, access=_mmap.ACCESS_READ) as mm:
+                header = read_header(mm)
+                emb = header.embedding
+                assert emb.sha256 == hashlib.sha256(b"\xab" * 2000).hexdigest()
+                model = header.models[0]
+                assert model.sha256 == hashlib.sha256(b"\xab" * 3000).hexdigest()
+
+    def test_digest_is_recorded_even_without_embeddings(self, tmp_path):
+        """skip_embeddings only skips anchor vectors, never integrity."""
+        from assembly.header import read_header
+
+        out = self._built(tmp_path)
+        with open(out, "rb") as fh:
+            assert read_header(fh.read()).models[0].sha256
+
+    def test_a_different_model_gets_a_different_digest(self, tmp_path):
+        from assembly.packer import _dig_key, _hash_file
+
+        a = tmp_path / "a.gguf"
+        b = tmp_path / "b.gguf"
+        a.write_bytes(b"\x00" * 32)
+        b.write_bytes(b"\x01" * 32)
+        assert a.stat().st_size == b.stat().st_size
+
+        # Same name and size, different content: the table must not collide.
+        assert _dig_key("m", a.stat().st_size) == _dig_key("m", b.stat().st_size)
+        assert _hash_file(a) != _hash_file(b)
+
+    def test_a_source_that_changes_under_the_build_is_caught(self, tmp_path):
+        """Same length, different bytes: only the digest can tell."""
+        from assembly.packer import BuildError, _copy_file
+
+        src = tmp_path / "m.gguf"
+        src.write_bytes(b"\x00" * 32)
+        digest = __import__("hashlib").sha256(b"\x00" * 32).hexdigest()
+        dst = io.BytesIO()
+
+        src.write_bytes(b"\x01" * 32)  # same size, new content
+        with pytest.raises(BuildError, match="SHA-256"):
+            _copy_file(src, dst, 32, "m", expect_sha256=digest)
+
+    def test_hashing_a_region_does_not_copy_the_whole_blob(self):
+        """A multi-gigabyte blob must not be materialised to be hashed."""
+        from assembly.header import HASH_CHUNK, hash_region
+
+        mm = memoryview(bytes(200))
+        assert hash_region(mm, 0, 200) == hash_region(mm, 0, 200)
+        assert HASH_CHUNK >= 1024 * 1024, "chunking is too fine to be useful"
+
+
+class TestInfoVerify:
+    """``assembly info --verify`` re-hashes and reports honestly."""
+
+    @staticmethod
+    def _run(archive, *extra):
+        """Invoke ``assembly info`` against *archive*; return its exit code."""
+        from assembly import main as main_mod
+
+        argv = ["info", "-m", str(archive), *extra]
+        try:
+            main_mod.main(argv)
+        except SystemExit as exc:
+            return exc.code or 0
+        return 0
+
+    def test_a_good_archive_verifies(self, tmp_path, capsys):
+        archive = TestBlobChecksums._built(tmp_path)
+
+        assert self._run(archive, "--verify") == 0
+        # The checkmark line goes to stderr, matching the rest of the CLI.
+        assert "verified" in capsys.readouterr().err
+
+    def test_a_corrupt_blob_is_reported_and_exits_nonzero(self, tmp_path,
+                                                          capsys):
+        archive = TestBlobChecksums._built(tmp_path)
+        # Flip a byte deep inside the first blob, well past the header.
+        with open(archive, "r+b") as fh:
+            fh.seek(4096 + 10)
+            fh.write(b"\xff")
+
+        assert self._run(archive, "--verify") == 1
+        captured = capsys.readouterr()
+        assert "MISMATCH" in captured.out
+        assert "corrupt" in captured.err
+
+    def test_plain_info_does_not_verify(self, tmp_path, capsys):
+        """Without the flag, info stays fast and reads only the header."""
+        archive = TestBlobChecksums._built(tmp_path)
+
+        assert self._run(archive) == 0
+        assert "MISMATCH" not in capsys.readouterr().out
+
+    def test_a_truncated_archive_fails_cleanly(self, tmp_path, capsys):
+        archive = TestBlobChecksums._built(tmp_path)
+        with open(archive, "r+b") as fh:
+            fh.truncate(200)
+
+        assert self._run(archive, "--verify") == 1
+        assert capsys.readouterr().err.strip() != ""
