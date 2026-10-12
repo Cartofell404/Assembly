@@ -1,28 +1,46 @@
 # Assembly
 
+[![CI](https://github.com/assembly-engine/assembly/actions/workflows/ci.yml/badge.svg)](https://github.com/assembly-engine/assembly/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+
 **A multi-model LLM router with a single binary distribution.**
 
 Assembly routes every prompt to the smallest model that can answer it. It packages multiple GGUF models into a single `.asmb` archive with an embedding-based router that selects the most appropriate model for each prompt.
 
 ## Installation
 
-### Option 1: Cargo install (recommended)
-```bash
-cargo install assembly
-```
+The crates are not published to crates.io (the names are taken), so install
+from a checkout or from a prebuilt release binary.
 
-### Option 2: Build from source
+### Option 1: Prebuilt binary (recommended)
+Download the binary for your platform from [GitHub Releases](https://github.com/assembly-engine/assembly/releases) and put it on your `PATH`:
+
+| Platform          | Asset                          |
+| ----------------- | ------------------------------ |
+| Linux x86-64      | `assembly-linux-x86_64`        |
+| macOS (Apple Silicon) | `assembly-macos-arm64`     |
+| macOS (Intel)     | `assembly-macos-x86_64`        |
+| Windows x86-64    | `assembly-windows-x86_64.exe`  |
+
+### Option 2: Installer script
+```bash
+git clone https://github.com/assembly-engine/assembly
+cd assembly
+./install.sh          # Linux / macOS (installs Rust and build deps if needed)
+```
+On Windows use `install.ps1` (PowerShell) or `install.bat`. Run `./uninstall.sh` to remove it.
+
+### Option 3: Build from source
 ```bash
 git clone https://github.com/assembly-engine/assembly
 cd assembly/rust
-cargo build --release
+cargo build --release --locked
 # Binary at ./target/release/assembly
+# Or install it globally: cargo install --path crates/cli --locked
 ```
 
-### Option 3: Download binary (GitHub Releases)
-Download the appropriate binary for your platform from [GitHub Releases](https://github.com/assembly-engine/assembly/releases).
-
-#### Platform-specific notes:
+#### Platform build notes:
 - **macOS**: Requires Xcode command line tools (`xcode-select --install`)
 - **Linux**: Requires `clang`, `cmake`, `pkg-config`
 - **Windows**: Requires Visual Studio Build Tools

@@ -9,31 +9,10 @@ models/
 *.jsonl
 
 # Build output
-build/
-dist/
-*.egg-info/
-.eggs/
-wheels/
+target/
 
 # Rust
-rust/target/
 **/*.rs.bk
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-env/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
-.tox/
 
 # Editors / OS
 .vscode/

@@ -109,7 +109,7 @@ pub fn decode(blob: &str, dim: usize) -> Result<Vec<Vec<f32>>> {
             "anchor embeddings declare an embedding dimension of 0",
         ));
     }
-    if packed.len() % ANCHOR_DTYPE_SIZE != 0 {
+    if !packed.len().is_multiple_of(ANCHOR_DTYPE_SIZE) {
         return Err(Error::anchors(format!(
             "anchor embeddings are {} bytes, which is not a whole number of {ANCHOR_DTYPE_SIZE}-byte float32 values",
             packed.len()
@@ -117,7 +117,7 @@ pub fn decode(blob: &str, dim: usize) -> Result<Vec<Vec<f32>>> {
     }
 
     let count = packed.len() / ANCHOR_DTYPE_SIZE;
-    if count % dim != 0 {
+    if !count.is_multiple_of(dim) {
         return Err(Error::anchors(format!(
             "anchor embeddings hold {count} values, which is not divisible by the recorded embedding dimension {dim}"
         )));
@@ -126,8 +126,10 @@ pub fn decode(blob: &str, dim: usize) -> Result<Vec<Vec<f32>>> {
     let mut out = Vec::with_capacity(count / dim);
     for chunk in packed.chunks_exact(dim * ANCHOR_DTYPE_SIZE) {
         let row = chunk
-            .chunks_exact(ANCHOR_DTYPE_SIZE)
-            .map(|c| f32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<ANCHOR_DTYPE_SIZE>()
+            .0
+            .iter()
+            .map(|c| f32::from_be_bytes(*c))
             .collect();
         out.push(row);
     }

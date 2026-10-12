@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["llm", "cli", "router", "gguf"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "assembly"
@@ -17,8 +19,7 @@ assembly-core = { workspace = true }
 llama-engine = { workspace = true }
 assembly-server = { workspace = true }
 anyhow = { workspace = true }
-indicatif = { version = "0.17", features = ["rayon"] }
-console = "0.15"
+indicatif = { version = "0.18", features = ["rayon"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["gguf", "archive", "serialization", "llm"]
+categories = ["encoding", "data-structures"]
 
 [dependencies]
 serde = { workspace = true }

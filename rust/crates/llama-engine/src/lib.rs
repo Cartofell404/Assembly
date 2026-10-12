@@ -657,7 +657,7 @@ fn stop_cut(stop: &[String], before: &str, new: &str) -> Option<usize> {
         }
 
         let mut consider = |at: usize| {
-            if best.map_or(true, |current| at < current) {
+            if best.is_none_or(|current| at < current) {
                 best = Some(at);
             }
         };
