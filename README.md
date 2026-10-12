@@ -284,4 +284,4 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 This project was brought to life with the help of AI assistance. The idea was conceived by the author, and AI tooling helped accelerate development, iteration, and documentation. Behind the idea is a human mind — the AI just helped turn caffeine into code faster.
 
-Built with curiosity, stubbornness, and a little bit of prompt engineering.
+Built with curiosity, stubbornness, and a little bit of prompt engineering.# Assembly
