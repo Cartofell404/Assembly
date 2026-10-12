@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security policy
-    url: https://github.com/assembly-engine/assembly/security/policy
+    url: https://github.com/Cartofell404/Assembly/security/policy
     about: Report vulnerabilities privately through GitHub, not as a public issue.

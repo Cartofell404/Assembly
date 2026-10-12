@@ -9,17 +9,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/assembly-engine/assembly"
+repository = "https://github.com/Cartofell404/Assembly"
 
 [workspace.dependencies]
-asmb-format = { version = "0.1.0", path = "crates/asmb-format" }
-assembly-core = { version = "0.1.0", path = "crates/assembly-core" }
-llama-engine = { version = "0.1.0", path = "crates/llama-engine" }
-assembly-server = { version = "0.1.0", path = "crates/assembly-server" }
+asmb-format = { version = "1.0.0-beta.1", path = "crates/asmb-format" }
+assembly-core = { version = "1.0.0-beta.1", path = "crates/assembly-core" }
+llama-engine = { version = "1.0.0-beta.1", path = "crates/llama-engine" }
+assembly-server = { version = "1.0.0-beta.1", path = "crates/assembly-server" }
 
 # A small, dependency-light HTTP server. Chosen over a full async framework
 # because generation is a blocking call that takes seconds: threads and a plain

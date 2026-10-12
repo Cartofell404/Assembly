@@ -13,7 +13,7 @@ body:
     attributes:
       label: Assembly version
       description: Output of `assembly --version`
-      placeholder: "assembly 0.1.0"
+      placeholder: "assembly 1.0.0-beta.1"
     validations:
       required: true
 

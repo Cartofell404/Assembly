@@ -8,7 +8,7 @@
 # These are not usable models. Nothing infers from them; they exist so the
 # format, the pre-flight checks and the writer can be exercised without pulling
 # gigabytes off the network. Real routing needs real weights and an inference
-# engine, which is Phase 3.
+# engine, which this demo deliberately avoids.
 #
 #   sh demo.sh            # writes into target/demo
 #   sh demo.sh /tmp/where  # or wherever you want it

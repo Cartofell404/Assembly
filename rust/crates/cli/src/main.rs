@@ -1,8 +1,8 @@
 //! `assembly` command line entry point.
 //!
-//! Phase 2 scope: build `.asmb` archives, validate build configs, and read or
-//! verify what was built. Inference comes later, behind a llama.cpp binding,
-//! and will add `serve` and `run`.
+//! Builds `.asmb` archives, validates build configs, reads or verifies what was
+//! built, and runs inference through the llama.cpp binding: `serve` exposes an
+//! OpenAI-compatible HTTP server, and `run` chats locally or against one.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

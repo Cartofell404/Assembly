@@ -207,9 +207,9 @@ fn build_writes_an_archive_info_can_read() {
 
 #[test]
 fn info_separates_anchor_phrases_from_anchor_vectors() {
-    // The two are independent: a phrase without a vector is normal until Phase 3
-    // embeds them, and collapsing them into one count reported a model with
-    // phrases as having none.
+    // The two are independent: a phrase without a vector is normal when the
+    // archive was built without embedding, and collapsing them into one count
+    // reported a model with phrases as having none.
     let fx = Fixture::new();
     let router = fx.gguf("route.gguf", 512);
     let a = fx.gguf("a.gguf", 4096);

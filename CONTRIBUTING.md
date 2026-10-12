@@ -5,7 +5,7 @@ Thanks for helping improve Assembly.
 ## Setup
 
 ```bash
-git clone https://github.com/assembly-engine/assembly
+git clone https://github.com/Cartofell404/Assembly
 cd assembly/rust
 cargo build
 ```

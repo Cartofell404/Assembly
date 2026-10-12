@@ -1,51 +1,78 @@
 # Assembly
 
-[![CI](https://github.com/assembly-engine/assembly/actions/workflows/ci.yml/badge.svg)](https://github.com/assembly-engine/assembly/actions/workflows/ci.yml)
+[![CI](https://github.com/Cartofell404/Assembly/actions/workflows/ci.yml/badge.svg)](https://github.com/Cartofell404/Assembly/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.1-yellowgreen.svg)](https://github.com/Cartofell404/Assembly/releases)
+
+> **Status: 1.0.0-beta.1** — feature-complete and usable, but it is a first
+> beta, so expect rough edges. The format and CLI are stabilising but not yet
+> frozen.
 
 **A multi-model LLM router with a single binary distribution.**
 
-Assembly routes every prompt to the smallest model that can answer it. It packages multiple GGUF models into a single `.asmb` archive with an embedding-based router that selects the most appropriate model for each prompt.
+Assembly packs several GGUF models into one `.asmb` archive and routes every
+prompt to the smallest model that can answer it. Instead of loading everything
+in RAM, only the model that gets chosen is loaded — so you get fast, cheap
+answers on hardware that could never hold a stack of models at once.
+
+## Features
+
+- **Single archive, many models** — one `.asmb` file bundles an embedding model
+  and any number of execution models, page-aligned with per-blob SHA-256
+  digests.
+- **Smart routing** — an embedding-based router picks the smallest model that
+  can answer each prompt; a fallback model covers anything it is unsure about.
+- **On-demand loading** — models are staged and loaded only when picked, and
+  evicted from RAM to make room for the next one.
+- **OpenAI-compatible server** — `assembly serve` exposes `/v1/chat/completions`
+  (with SSE streaming), `/v1/models`, and more, so it works with existing
+  OpenAI tooling.
+- **No runtime outside the binary** — one executable does build, inspect,
+  serve, and chat.
 
 ## Installation
 
 The crates are not published to crates.io (the names are taken), so install
-from a checkout or from a prebuilt release binary.
+from a prebuilt binary or from a checkout.
 
 ### Option 1: Prebuilt binary (recommended)
-Download the binary for your platform from [GitHub Releases](https://github.com/assembly-engine/assembly/releases) and put it on your `PATH`:
 
-| Platform          | Asset                          |
-| ----------------- | ------------------------------ |
-| Linux x86-64      | `assembly-linux-x86_64`        |
-| macOS (Apple Silicon) | `assembly-macos-arm64`     |
-| macOS (Intel)     | `assembly-macos-x86_64`        |
-| Windows x86-64    | `assembly-windows-x86_64.exe`  |
+Download the binary for your platform from [GitHub Releases](https://github.com/Cartofell404/Assembly/releases) and put it on your `PATH`:
+
+| Platform               | Asset                          |
+| ---------------------- | ------------------------------ |
+| Linux x86-64           | `assembly-linux-x86_64`        |
+| macOS (Apple Silicon)  | `assembly-macos-arm64`         |
+| macOS (Intel)          | `assembly-macos-x86_64`        |
+| Windows x86-64         | `assembly-windows-x86_64.exe`  |
 
 ### Option 2: Installer script
+
 ```bash
-git clone https://github.com/assembly-engine/assembly
+git clone https://github.com/Cartofell404/Assembly
 cd assembly
-./install.sh          # Linux / macOS (installs Rust and build deps if needed)
+./install.sh              # Linux / macOS (installs Rust and build deps if needed)
 ```
-On Windows use `install.ps1` (PowerShell) or `install.bat`. Run `./uninstall.sh` to remove it.
+
+On Windows run `install.bat`. Run `./uninstall.sh` to remove Assembly.
 
 ### Option 3: Build from source
+
 ```bash
-git clone https://github.com/assembly-engine/assembly
+git clone https://github.com/Cartofell404/Assembly
 cd assembly/rust
 cargo build --release --locked
 # Binary at ./target/release/assembly
 # Or install it globally: cargo install --path crates/cli --locked
 ```
 
-#### Platform build notes:
-- **macOS**: Requires Xcode command line tools (`xcode-select --install`)
-- **Linux**: Requires `clang`, `cmake`, `pkg-config`
-- **Windows**: Requires Visual Studio Build Tools
+> **Platform notes:** macOS needs Xcode Command Line Tools
+> (`xcode-select --install`). Linux needs `clang`, `cmake`, `pkg-config`.
+> Windows needs Visual Studio Build Tools. The first build compiles llama.cpp,
+> so it takes 5–10 minutes; later builds are incremental (~30 seconds).
 
-### Quick Start
+## Quick start
 
 ```bash
 # 1. Write a config.json (see the format under `assembly build` below)
@@ -62,8 +89,6 @@ assembly info models.asmb --verify
 # 5. Chat (picks up a server if one is running, otherwise runs locally)
 assembly run models.asmb "Write a hello world in Rust"
 ```
-
----
 
 ## Commands
 
@@ -82,6 +107,7 @@ Options:
 ```
 
 **Config format:**
+
 ```json
 {
   "assembly_name": "my-router",
@@ -199,10 +225,8 @@ assembly run models.asmb "one answer" # answer, then keep chatting
 ```
 
 Inside the session: `/clear` drops the history, `/quit` (or Ctrl-D) exits.
-An answer is streamed token by token as it is generated -- nothing is held back
+An answer is streamed token by token as it is generated — nothing is held back
 until the model is done.
-
----
 
 ## Environment
 
@@ -211,8 +235,6 @@ until the model is done.
   (`ggml_metal_device_init`, pipeline compiles, and the rest). By default
   `run` and `serve` keep that to themselves: it is noise on every start and
   says nothing about your archive.
-
----
 
 ## Architecture
 
@@ -235,35 +257,28 @@ Prompt → Embed → Cosine Similarity → Select Model → Generate
 
 ## Requirements
 
-- **Rust 1.88+** (via `rustup`)
+- **Rust 1.88+** to build from source (via `rustup`)
 - **Build dependencies**: `cmake`, `clang` (for llama.cpp)
 - **Models**: GGUF format
 
-### First Build
-```bash
-cd rust
-cargo build --release  # Takes 5-10 minutes (compiles llama.cpp)
-```
+## Contact
 
-Subsequent builds are incremental (~30 seconds).
+Questions, ideas, or feedback? Reach the maintainer at
+[devcartofell@gmail.com](mailto:devcartofell@gmail.com).
 
----
+For security issues, do **not** open a public issue — see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT License - see [LICENSE](LICENSE)
-
----
+MIT License — see [LICENSE](LICENSE).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md)
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md)
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Acknowledgements
 

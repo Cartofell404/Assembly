@@ -2,8 +2,9 @@
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for security problems. Instead, use GitHub's
-private vulnerability reporting on this repository:
+Please do not open a public issue for security problems. Instead, report it
+privately via email to devcartofell@gmail.com, or use GitHub's private
+vulnerability reporting on this repository:
 
 1. Go to the **Security** tab.
 2. Click **Report a vulnerability**.

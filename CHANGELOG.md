@@ -5,7 +5,10 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0-beta.1] - 2026-10-12
+
+First public beta: feature-complete, but may still have bugs. Parts of the
+format and CLI are stabilising but not yet frozen.
 
 ### Added
 
@@ -20,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`assembly-server`).
 - Local GGUF inference over llama.cpp (`llama-engine`).
 - CLI subcommands: `build`, `validate`, `info`, `embed`, `serve`, `run`.
-- Installers for Linux/macOS (`install.sh`), Windows (`install.ps1`,
-  `install.bat`), and a `uninstall.sh`.
+- Installers for Linux/macOS (`install.sh`), Windows (`install.bat`), and a
+  `uninstall.sh`.
 
 ## [0.1.0]
 
