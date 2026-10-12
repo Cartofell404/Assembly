@@ -1,6 +1,5 @@
 name: Feature Request
-
-about: Suggest a capability for Assembly Engine
+description: Suggest a capability for Assembly
 title: "[feature]: "
 labels: ["enhancement"]
 body:

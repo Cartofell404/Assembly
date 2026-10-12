@@ -15,6 +15,10 @@ dist/
 .eggs/
 wheels/
 
+# Rust
+rust/target/
+**/*.rs.bk
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1,0 +1,12 @@
+[package]
+name = "llama-engine"
+description = "llama.cpp implementation of the Assembly engine seam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+assembly-core = { workspace = true }
+llama-cpp-2 = { workspace = true }

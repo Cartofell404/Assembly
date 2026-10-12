@@ -1,0 +1,27 @@
+[package]
+name = "assembly"
+description = "Assembly: route every prompt to the smallest model that can answer it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "assembly"
+path = "src/main.rs"
+
+[dependencies]
+asmb-format = { workspace = true }
+assembly-core = { workspace = true }
+llama-engine = { workspace = true }
+assembly-server = { workspace = true }
+anyhow = { workspace = true }
+indicatif = { version = "0.17", features = ["rayon"] }
+console = "0.15"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

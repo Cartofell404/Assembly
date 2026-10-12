@@ -1,7 +1,6 @@
-name: Issue Templates
-
-about: Bug reports and feature requests for Assembly Engine
-title: "[issue]: "
+name: Bug Report
+description: Report a bug in Assembly
+title: "[bug]: "
 labels: ["needs triage"]
 body:
   - type: markdown
@@ -52,9 +51,9 @@ body:
     attributes:
       label: Environment
       description: |
-        - OS and version:
-        - Python version:
-        - llama-cpp-python version:
+        - Assembly version (`assembly --version`):
+        - OS and architecture:
+        - How Assembly was installed (cargo, installer script, prebuilt binary):
         - GPU / accelerator:
         - Assembly mode: `run` or `serve`
     validations:

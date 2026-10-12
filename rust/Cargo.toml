@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/asmb-format",
+    "crates/assembly-core",
+    "crates/assembly-server",
+    "crates/llama-engine",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/assembly-engine/assembly"
+
+[workspace.dependencies]
+asmb-format = { path = "crates/asmb-format" }
+assembly-core = { path = "crates/assembly-core" }
+llama-engine = { path = "crates/llama-engine" }
+assembly-server = { path = "crates/assembly-server" }
+
+# A small, dependency-light HTTP server. Chosen over a full async framework
+# because generation is a blocking call that takes seconds: threads and a plain
+# reader are a better fit than an event loop, and the binary stays small.
+tiny_http = "0.12"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+anyhow = "1"
+thiserror = "2"
+
+# llama.cpp itself. Builds llama.cpp from source with cmake on first compile,
+# which takes a few minutes and is then cached. Requires clang (for bindgen) and
+# cmake; both are needed on any machine that compiles this workspace.
+llama-cpp-2 = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
