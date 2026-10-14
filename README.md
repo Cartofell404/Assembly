@@ -10,7 +10,7 @@
 [![Version](https://img.shields.io/badge/version-1.0.0--beta.1-yellowgreen.svg)](https://github.com/Cartofell404/Assembly/releases)
 [![Platform: macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon%20(arm64)-1f6feb.svg)](https://github.com/Cartofell404/Assembly)
 
-[Quick start](#quick-start) · [Installation](#installation) · [Commands](#commands) · [Architecture](#architecture) · [Contributing](CONTRIBUTING.md)
+[Quick start](#quick-start) · [Installation](#installation) · [Commands](#commands) · [Architecture](#architecture)
 
 </div>
 
@@ -310,10 +310,6 @@ Workspace crates: `asmb-format` (archive format), `assembly-core` (router), `ass
 - Apple Silicon macOS only
 - Beta: the archive format and CLI may still change
 - Not published to crates.io; install via binary, installer, or source
-
-## Contributing
-
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Contact
 
