@@ -60,17 +60,9 @@ assembly run models.asmb "Write a hello world in Rust"
 
 ## Installation
 
-Assembly supports **macOS on Apple Silicon (arm64) only**. The crates are not published to crates.io (the names are taken), so install from a prebuilt binary or from a checkout.
+Assembly supports **macOS on Apple Silicon (arm64) only**. The crates are not published to crates.io, so install from a prebuilt binary or from a checkout.
 
-### Option 1: Prebuilt binary (recommended)
-
-Download the binary from [GitHub Releases](https://github.com/Cartofell404/Assembly/releases) and put it on your `PATH`.
-
-| Platform              | Asset                  |
-| --------------------- | ---------------------- |
-| macOS (Apple Silicon) | `assembly-macos-arm64` |
-
-### Option 2: Installer script
+### Option 1: Installer script
 
 ```bash
 git clone https://github.com/Cartofell404/Assembly
@@ -80,7 +72,7 @@ cd Assembly
 
 Remove Assembly later with `./uninstall.sh`.
 
-### Option 3: Build from source
+### Option 2: Build from source
 
 ```bash
 git clone https://github.com/Cartofell404/Assembly
@@ -232,9 +224,6 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 If you started the server with `--api-key`, add `-H "Authorization: Bearer <key>"`.
 
-> [!WARNING]
-> The server binds to loopback by default. Binding to a non-loopback address requires an API key. See [SECURITY.md](SECURITY.md) for what is and isn't defended against.
-
 ### `assembly run`
 
 Interactive chat. Type a prompt, watch the answer stream, type another. The conversation is kept for the whole session, on both paths below.
@@ -325,14 +314,6 @@ Workspace crates: `asmb-format` (archive format), `assembly-core` (router), `ass
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
-
-## Security
-
-Please do **not** open a public issue for security problems. See [SECURITY.md](SECURITY.md).
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md).
 
 ## Contact
 
