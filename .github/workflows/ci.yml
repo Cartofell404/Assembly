@@ -17,16 +17,12 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
-    runs-on: ${{ matrix.os }}
+    name: Test (Rust ${{ matrix.rust }})
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
-        include:
-          - os: ubuntu-latest
-            rust: nightly
     timeout-minutes: 60
     defaults:
       run:
@@ -38,28 +34,20 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang pkg-config libssl-dev
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
+          targets: aarch64-apple-darwin
+      - name: Install system dependencies
         run: brew install cmake llvm
-      - name: Install system dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: choco install cmake llvm -y
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          key: ${{ matrix.os }}-${{ matrix.rust }}
+          key: macos-${{ matrix.rust }}
       - name: Build
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
       # Clippy and rustfmt are only meaningful on the pinned stable toolchain;
-      # beta and nightly pick up new lints and formatter changes, which would
+      # beta picks up new lints and formatter changes, which would
       # fail unrelated PRs. Build and test still run on every toolchain.
       - name: Clippy
         if: matrix.rust == 'stable'
@@ -68,14 +56,14 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo fmt --all --check
       - name: Install smoke test
-        if: matrix.rust == 'stable' && runner.os == 'Linux'
+        if: matrix.rust == 'stable'
         run: |
           cargo install --path crates/cli --locked --debug --root "$RUNNER_TEMP/asm-root"
           "$RUNNER_TEMP/asm-root/bin/assembly" --version
 
   msrv:
     name: MSRV (Rust 1.88)
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     timeout-minutes: 60
     defaults:
       run:
@@ -86,10 +74,9 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
+          targets: aarch64-apple-darwin
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang pkg-config libssl-dev
+        run: brew install cmake llvm
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -99,7 +86,7 @@ jobs:
 
   audit:
     name: Dependency audit
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
@@ -110,10 +97,7 @@ jobs:
     name: Build Release Artifacts
     needs: test
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: macos-14
     defaults:
       run:
         working-directory: rust
@@ -121,36 +105,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Install dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang pkg-config libssl-dev
+        with:
+          targets: aarch64-apple-darwin
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - name: Build release
-        run: cargo build --release --locked --bin assembly
+        run: cargo build --release --locked --bin assembly --target aarch64-apple-darwin
       - name: Stage binary
         shell: bash
         run: |
           mkdir -p dist
-          case "${{ runner.os }}" in
-            Linux)   name=assembly-linux-x86_64 ;;
-            macOS)   name=assembly-macos-$(uname -m) ;;
-            Windows) name=assembly-windows-x86_64.exe ;;
-          esac
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp target/release/assembly.exe "dist/$name"
-          else
-            cp target/release/assembly "dist/$name"
-          fi
+          cp target/aarch64-apple-darwin/release/assembly "dist/assembly-macos-arm64"
           ls -la dist
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: assembly-${{ matrix.os }}
+          name: assembly-macos-14
           path: rust/dist/*
           if-no-files-found: error
 
@@ -158,7 +130,7 @@ jobs:
     name: Create Release
     needs: build-release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     permissions:
       contents: write
     steps:
@@ -172,7 +144,7 @@ jobs:
         run: |
           cd artifacts
           for f in assembly*; do
-            sha256sum "$f" > "$f.sha256"
+            shasum -a 256 "$f" > "$f.sha256"
           done
           ls -la
       - name: Create Release

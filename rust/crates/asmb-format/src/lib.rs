@@ -34,6 +34,11 @@
 
 #![deny(missing_docs)]
 
+// Assembly is built for macOS on Apple Silicon only. Every crate in the
+// workspace depends on this one, so a single guard covers them all.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+compile_error!("Assembly supports only macOS on Apple Silicon (aarch64-apple-darwin)");
+
 pub mod anchors;
 pub mod checksum;
 pub mod error;

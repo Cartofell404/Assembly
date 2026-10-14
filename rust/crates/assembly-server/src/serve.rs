@@ -764,7 +764,6 @@ pub fn serve(
 
     let port = match server.server_addr() {
         ListenAddr::IP(ip) => ip.port(),
-        #[cfg(unix)]
         ListenAddr::Unix(_) => settings.port,
     };
 

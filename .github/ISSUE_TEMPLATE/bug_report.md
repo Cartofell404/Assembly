@@ -52,7 +52,7 @@ body:
       label: Environment
       description: |
         - Assembly version (`assembly --version`):
-        - OS and architecture:
+        - macOS version and architecture (`arm64`):
         - How Assembly was installed (cargo, installer script, prebuilt binary):
         - GPU / accelerator:
         - Assembly mode: `run` or `serve`

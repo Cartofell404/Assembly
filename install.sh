@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Assembly - Complete installer that sets up everything needed
-# Installs Rust, build dependencies, builds and installs assembly globally
+# macOS on Apple Silicon (arm64) only:
+# installs Rust, build dependencies, builds and installs assembly globally
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,9 +25,19 @@ BINDIR="${INSTALL_PREFIX}/bin"
 CARGO_HOME="${HOME}/.cargo"
 CARGO_BIN="${CARGO_HOME}/bin"
 
-# Detect OS
+# Platform check: Apple Silicon only.
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+
+if [[ "${OS}" != "Darwin" ]]; then
+    err "Unsupported OS: ${OS}. Assembly supports macOS on Apple Silicon only."
+    exit 1
+fi
+
+if [[ "${ARCH}" != "arm64" ]]; then
+    err "Unsupported architecture: ${ARCH}. Assembly supports Apple Silicon (arm64) only."
+    exit 1
+fi
 
 ensure_dir() {
     mkdir -p "$1"
@@ -57,46 +68,6 @@ install_rust() {
     log "Rust installed successfully"
 }
 
-install_deps_linux() {
-    local pkg_manager=""
-    local pkgs=""
-    
-    if command_exists apt-get; then
-        pkg_manager="apt-get"
-        # cmake, clang, pkg-config, libssl-dev, build-essential
-        pkgs="build-essential cmake clang pkg-config libssl-dev"
-    elif command_exists yum; then
-        pkg_manager="yum"
-        pkgs="cmake clang pkgconfig openssl-devel gcc-c++ make"
-    elif command_exists dnf; then
-        pkg_manager="dnf"
-        pkgs="cmake clang pkgconf-pkg-config openssl-devel gcc-c++ make"
-    elif command_exists pacman; then
-        pkg_manager="pacman"
-        pkgs="cmake clang pkgconf openssl base-devel"
-    elif command_exists apk; then
-        pkg_manager="apk"
-        pkgs="cmake clang pkgconf openssl-dev build-base"
-    else
-        warn "Unknown package manager. Attempting to build without installing system deps."
-        warn "You may need to install cmake, clang, openssl-dev manually."
-        return 0
-    fi
-    
-    info "Detected ${pkg_manager}, installing build dependencies: ${pkgs}"
-    
-    if [[ "${pkg_manager}" == "apt-get" ]]; then
-        sudo apt-get update -qq 2>/dev/null || true
-        sudo apt-get install -y -qq ${pkgs} 2>/dev/null || warn "Some packages failed to install (may already be present)"
-    elif [[ "${pkg_manager}" == "pacman" ]]; then
-        sudo pacman -Sy --noconfirm --needed ${pkgs} 2>/dev/null || warn "Some packages failed to install"
-    else
-        sudo ${pkg_manager} install -y ${pkgs} 2>/dev/null || warn "Some packages failed to install"
-    fi
-    
-    log "System dependencies installed"
-}
-
 install_deps_macos() {
     if command_exists brew; then
         log "Homebrew detected, installing dependencies..."
@@ -112,17 +83,7 @@ install_deps_macos() {
 }
 
 install_deps() {
-    case "${OS}" in
-        Linux*)
-            install_deps_linux
-            ;;
-        Darwin*)
-            install_deps_macos
-            ;;
-        *)
-            warn "Unsupported OS: ${OS}. Proceeding anyway..."
-            ;;
-    esac
+    install_deps_macos
 }
 
 build_and_install() {

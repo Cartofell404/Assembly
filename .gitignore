@@ -19,7 +19,6 @@ target/
 .idea/
 *.swp
 .DS_Store
-Thumbs.db
 
 # Local scratch
 *.log

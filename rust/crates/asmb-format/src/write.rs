@@ -232,9 +232,8 @@ impl BuildPlan {
     ///
     /// An existing archive at `dest` is replaced. Callers that want to refuse
     /// first -- as the CLI does, unless `--force` is given -- must check
-    /// themselves. On Windows the replacement fails instead, because
-    /// `rename` there refuses an existing destination; the overwrite policy
-    /// belongs in one place, and today that place is the pre-flight check.
+    /// themselves, because the overwrite policy belongs in one place, and
+    /// today that place is the pre-flight check.
     ///
     /// # Errors
     ///
@@ -327,8 +326,8 @@ impl BuildPlan {
         // the new one looks finished.
         //
         // Best-effort on purpose. The archive is already written, verified and
-        // renamed, so a filesystem that cannot sync a directory (Windows, some
-        // network mounts) must not turn a good build into a reported failure.
+        // renamed, so a filesystem that cannot sync a directory (some network
+        // mounts) must not turn a good build into a reported failure.
         let _ = fsync_dir(dest.parent().unwrap_or_else(|| Path::new(".")));
 
         Ok(BuildReport {
@@ -558,21 +557,12 @@ fn partial_path(dest: &Path) -> PathBuf {
 
 /// Ask the OS to persist a directory entry.
 ///
-/// Unix only, and best-effort by design: see the call site. On platforms without
-/// `O_DIRECTORY` this is a no-op that reports success, because "this filesystem
-/// cannot sync directories" is not a build failure.
-#[cfg(unix)]
+/// Best-effort by design: see the call site. "This filesystem cannot sync
+/// directories" is not a build failure, so callers ignore the result.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    // Opening a directory read-only succeeds on Unix, and `sync_all` fsyncs the
-    // descriptor it holds -- which is what makes the rename durable.
+    // Opening a directory read-only succeeds on macOS, and `sync_all` fsyncs
+    // the descriptor it holds -- which is what makes the rename durable.
     File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
-    // Windows cannot open a directory as a file at all. The rename is still
-    // atomic there; only its durability across a power cut is unguaranteed.
-    Ok(())
 }
 
 fn page_of(header: &AsmbHeader) -> u64 {

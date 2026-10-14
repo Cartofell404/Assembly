@@ -395,54 +395,31 @@ impl ResidentCache {
 /// by RAM is worth more than one sized by nothing, so callers that can fall
 /// back to a count limit should.
 pub fn physical_memory_bytes() -> Result<u64, ConfigError> {
-    #[cfg(target_os = "macos")]
-    {
-        // sysctl hw.memsize, read directly rather than shelling out to
-        // sysctl: this runs on the request path when a cache is first created.
-        let mut size: u64 = 0;
-        let mut len = std::mem::size_of::<u64>();
-        let name = b"hw.memsize\0";
-        let rc = unsafe {
-            libc_sysctlbyname(
-                name.as_ptr() as *const std::os::raw::c_char,
-                &mut size as *mut u64 as *mut std::os::raw::c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc == 0 && size > 0 {
-            return Ok(size);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("MemTotal:") {
-                    let kb: u64 = rest
-                        .trim()
-                        .trim_end_matches(" kB")
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
-                    if kb > 0 {
-                        return Ok(kb * 1024);
-                    }
-                }
-            }
-        }
+    // sysctl hw.memsize, read directly rather than shelling out to
+    // sysctl: this runs on the request path when a cache is first created.
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let name = b"hw.memsize\0";
+    let rc = unsafe {
+        libc_sysctlbyname(
+            name.as_ptr() as *const std::os::raw::c_char,
+            &mut size as *mut u64 as *mut std::os::raw::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && size > 0 {
+        return Ok(size);
     }
 
     Err(ConfigError::Other(
-        "cannot determine physical memory on this platform; pass an explicit \
+        "cannot determine physical memory; pass an explicit \
      resident budget instead"
             .to_string(),
     ))
 }
 
-#[cfg(target_os = "macos")]
 extern "C" {
     #[link_name = "sysctlbyname"]
     fn libc_sysctlbyname(
@@ -905,20 +882,13 @@ mod tests {
 
     #[test]
     fn physical_memory_is_reported_when_the_platform_knows() {
-        // Windows has no implementation yet, so this is a real check rather
-        // than an assumption: on macOS and Linux it must come back plausible.
-        match physical_memory_bytes() {
-            Ok(bytes) => {
-                // Below 64 MB is not a machine; above 1 TiB is not either.
-                assert!(bytes > 64 * 1024 * 1024, "implausible: {bytes} bytes");
-                assert!(bytes < 1024 * 1024 * 1024 * 1024, "implausible: {bytes}");
-            }
-            Err(e) => {
-                // An honest failure is acceptable on an unknown platform; a
-                // wrong number is not.
-                assert!(e.to_string().contains("physical memory"), "got {e}");
-            }
-        }
+        // macOS is the only supported platform and always knows the answer, so
+        // this is a real check rather than an assumption: it must come back
+        // plausible, not an error.
+        let bytes = physical_memory_bytes().expect("sysctl hw.memsize must report on macOS");
+        // Below 64 MB is not a machine; above 1 TiB is not either.
+        assert!(bytes > 64 * 1024 * 1024, "implausible: {bytes} bytes");
+        assert!(bytes < 1024 * 1024 * 1024 * 1024, "implausible: {bytes}");
     }
 
     #[test]
