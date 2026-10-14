@@ -120,7 +120,7 @@ jobs:
           cp target/aarch64-apple-darwin/release/assembly "dist/assembly-macos-arm64"
           ls -la dist
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: assembly-macos-14
           path: rust/dist/*
