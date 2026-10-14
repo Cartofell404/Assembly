@@ -92,6 +92,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rust
 
   build-release:
     name: Build Release Artifacts
