@@ -559,10 +559,28 @@ fn partial_path(dest: &Path) -> PathBuf {
 ///
 /// Best-effort by design: see the call site. "This filesystem cannot sync
 /// directories" is not a build failure, so callers ignore the result.
+#[cfg(unix)]
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    // Opening a directory read-only succeeds on macOS, and `sync_all` fsyncs
+    // Opening a directory read-only succeeds on Unix, and `sync_all` fsyncs
     // the descriptor it holds -- which is what makes the rename durable.
     File::open(dir)?.sync_all()
+}
+
+/// Ask the OS to persist a directory entry.
+///
+/// Best-effort by design: see the call site. "This filesystem cannot sync
+/// directories" is not a build failure, so callers ignore the result.
+#[cfg(windows)]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    // Windows cannot fsync a directory through `std`: `File::open` refuses to
+    // open one, and `FlushFileBuffers` needs a handle obtained with
+    // `FILE_FLAG_BACKUP_SEMANTICS`, which `std` does not set. There is nothing
+    // to flush here either way -- the file's own contents were synced before the
+    // rename, and NTFS journals the metadata change the rename makes. The
+    // directory is still stat'd so a path that is not there reports an error,
+    // matching the Unix contract the callers and tests already rely on.
+    std::fs::metadata(dir)?;
+    Ok(())
 }
 
 fn page_of(header: &AsmbHeader) -> u64 {

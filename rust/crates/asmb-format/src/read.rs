@@ -282,10 +282,6 @@ impl Archive {
         let mut blobs = Vec::new();
 
         // Check router if present - always include it
-        println!(
-            "DEBUG: embedding.is_present() = {}",
-            self.header.embedding.is_present()
-        );
         if self.header.embedding.is_present() {
             let e = &self.header.embedding;
             if !e.sha256.is_empty() {

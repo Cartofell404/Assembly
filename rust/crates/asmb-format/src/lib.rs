@@ -34,10 +34,19 @@
 
 #![deny(missing_docs)]
 
-// Assembly is built for macOS on Apple Silicon only. Every crate in the
-// workspace depends on this one, so a single guard covers them all.
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-compile_error!("Assembly supports only macOS on Apple Silicon (aarch64-apple-darwin)");
+// Assembly ships supported builds for macOS on Apple Silicon and for 64-bit
+// Windows. Every crate in the workspace depends on this one, so a single guard
+// covers them all: the platform-specific code (physical RAM probing, atomic
+// build output) is written for exactly these targets, and building elsewhere
+// would link symbols the target does not provide.
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_pointer_width = "64"),
+)))]
+compile_error!(
+    "Assembly supports macOS on Apple Silicon (aarch64-apple-darwin) and 64-bit Windows \
+     (x86_64-pc-windows-msvc, x86_64-pc-windows-gnu, or aarch64-pc-windows-msvc)"
+);
 
 pub mod anchors;
 pub mod checksum;

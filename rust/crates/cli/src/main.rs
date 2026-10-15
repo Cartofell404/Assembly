@@ -204,6 +204,17 @@ fn discover_servers(ports: &[u16]) -> Vec<ServerInfo> {
     servers
 }
 
+/// Whether a bare `run` argument names an archive file rather than a model
+/// alias.
+///
+/// A trailing `.asmb` is the reliable signal. A path separator is the fallback
+/// for an archive renamed on its way to the terminal; `is_separator` is used
+/// rather than a literal so `C:\models\mesh` is recognised on Windows and a
+/// stray backslash in a Unix alias is not mistaken for one.
+fn looks_like_archive_path(arg: &str) -> bool {
+    arg.ends_with(".asmb") || arg.chars().any(std::path::is_separator)
+}
+
 /// `run [options] [archive.asmb] [prompt ...]`
 ///
 /// The chat entry point. Without `--local` it looks for a running server and
@@ -278,7 +289,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     if !positionals.is_empty() {
         if !archive_flag && archive.is_none() {
             let first = &positionals[0];
-            if first.ends_with(".asmb") || first.contains('/') {
+            if looks_like_archive_path(first) {
                 archive = Some(PathBuf::from(first));
                 if positionals.len() > 1 {
                     prompt = Some(positionals[1..].join(" "));
@@ -303,7 +314,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     // deliberately accepts no uploads.
     let archive_is_path = archive.as_deref().is_some_and(|p| {
         let s = p.to_string_lossy();
-        s.ends_with(".asmb") || s.contains('/')
+        looks_like_archive_path(&s)
     });
 
     let explicit_url = server_url.or_else(|| port.map(|p| format!("http://127.0.0.1:{p}")));
@@ -1428,6 +1439,20 @@ mod tests {
     fn takes_the_first_line_of_a_persona() {
         assert_eq!(first_line("one\ntwo\nthree"), "one");
         assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn recognises_an_archive_argument() {
+        // The extension is unambiguous everywhere.
+        assert!(looks_like_archive_path("mesh.asmb"));
+        // A forward-slash path is a path on every supported platform.
+        assert!(looks_like_archive_path("./mesh"));
+        // A bare word is a model alias, not a file.
+        assert!(!looks_like_archive_path("general"));
+        assert!(!looks_like_archive_path("code"));
+        // A backslash separates path components on Windows only, so the
+        // expectation itself depends on the platform.
+        assert_eq!(looks_like_archive_path(r"models\mesh"), cfg!(windows));
     }
 
     #[test]

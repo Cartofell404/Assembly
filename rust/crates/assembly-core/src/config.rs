@@ -721,10 +721,11 @@ fn check_model_file(
 }
 
 /// Free bytes on the volume holding `path`, or 0 when it cannot be determined.
+#[cfg(unix)]
 fn free_space(path: &Path) -> u64 {
     // std has no statvfs, and a build that discovers a full disk an hour in is
-    // the failure this check exists to prevent. `df` is the portable answer
-    // without pulling in a platform-specific dependency for one number.
+    // the failure this check exists to prevent. `df` is the portable answer on
+    // Unix without pulling in a platform-specific dependency for one number.
     let probe = if path.exists() { path } else { Path::new(".") };
     let Ok(output) = std::process::Command::new("df")
         .arg("-k")
@@ -749,11 +750,61 @@ fn free_space(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Free bytes on the volume holding `path`, or 0 when it cannot be determined.
+#[cfg(windows)]
+fn free_space(path: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_available: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    // A destination that does not exist yet still lives on some volume; the
+    // caller hands us its parent, and `.` covers a path with no parent at all.
+    let probe = if path.exists() { path } else { Path::new(".") };
+    let mut wide: Vec<u16> = probe.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut available: u64 = 0;
+    // SAFETY: `wide` is NUL-terminated and outlives the call, and the one output
+    // pointer passed is valid, aligned and writable. The API treats the two
+    // remaining parameters as optional, so null is allowed for them.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        available
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::Write as _;
+
+    /// A path, escaped for the inside of a JSON string literal.
+    ///
+    /// `Path::display` uses the platform separator, so a Windows temporary path
+    /// arrives as `C:\Users\...` and `\U` is not a valid JSON escape, which
+    /// would make the generated config unparseable. Running the text through
+    /// `serde_json` gives exactly the escaping JSON expects on every platform.
+    fn jp(path: impl std::fmt::Display) -> String {
+        let quoted = serde_json::to_string(&path.to_string()).unwrap();
+        quoted[1..quoted.len() - 1].to_string()
+    }
 
     /// A GGUF file with a real header: magic, version, no tensors, no metadata.
     fn gguf(dir: &Path, name: &str, size: usize) -> PathBuf {
@@ -805,15 +856,19 @@ mod tests {
         let models_json: Vec<String> = models
             .iter()
             .map(|(name, path)| {
-                format!(r#"{{"name":"{name}","path":"{path}","anchors":["a phrase","another"]}}"#)
+                format!(
+                    r#"{{"name":"{name}","path":"{}","anchors":["a phrase","another"]}}"#,
+                    jp(path)
+                )
             })
             .collect();
         let json = format!(
             r#"{{
                 "assembly_name": "Test",
-                "embedding": {{"name":"route","path":"{embedding}","confidence_threshold":0.7}},
+                "embedding": {{"name":"route","path":"{}","confidence_threshold":0.7}},
                 "models": [{}]
             }}"#,
+            jp(embedding),
             models_json.join(",")
         );
         let path = dir.join("config.json");
@@ -966,8 +1021,8 @@ mod tests {
                     "embedding":{{"name":"r","path":"relative/route.gguf"}},
                     "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                route.display()
+                jp(route.display()),
+                jp(route.display())
             ),
         )
         .unwrap();
@@ -991,9 +1046,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}","confidence_threshold":1.5}},
                     "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1017,9 +1072,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}","fallback_model":"ghost"}},
                     "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1070,9 +1125,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":[]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1101,9 +1156,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}"}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1129,9 +1184,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":["hi",42]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1161,9 +1216,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":"hi"}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1190,9 +1245,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":["How are you","  how are you  "]}},
                               {{"name":"b","path":"{}","anchors":["x","y"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1220,9 +1275,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}","fallback_model":7}},
                     "models":[{{"name":"a","path":"{}","anchors":["x","y"]}},
                               {{"name":"b","path":"{}","anchors":["x","y"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1254,9 +1309,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":["hi",42]}},
                               {{"name":"b","path":"{}","anchors":["x","y"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1285,9 +1340,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":["only one"]}},
                               {{"name":"b","path":"{}","anchors":["x","y"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1315,9 +1370,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":["hi","   "]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                a.display(),
-                b.display()
+                jp(route.display()),
+                jp(a.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1416,9 +1471,9 @@ mod tests {
                         "embedding":{{"name":"r","path":"{}"}},
                         "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                                   {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                    route.display(),
-                    a.display(),
-                    b.display()
+                    jp(route.display()),
+                    jp(a.display()),
+                    jp(b.display())
                 ),
             )
             .unwrap();
@@ -1449,9 +1504,9 @@ mod tests {
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                               {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-                route.display(),
-                missing.display(),
-                b.display()
+                jp(route.display()),
+                jp(missing.display()),
+                jp(b.display())
             ),
         )
         .unwrap();
@@ -1479,7 +1534,7 @@ mod tests {
                 r#"{{"assembly_name":"T",
                     "embedding":{{"name":"r","path":"{}"}},
                     "models":["just a string", 42]}}"#,
-                route.display()
+                jp(route.display())
             ),
         )
         .unwrap();

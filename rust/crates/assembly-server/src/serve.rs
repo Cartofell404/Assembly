@@ -764,6 +764,11 @@ pub fn serve(
 
     let port = match server.server_addr() {
         ListenAddr::IP(ip) => ip.port(),
+        // `Server::http` above always binds TCP, so this arm is unreachable
+        // today. It is kept for exhaustiveness on Unix, where `ListenAddr` also
+        // has a `Unix` variant; Windows has no such variant, so the arm is
+        // compiled out there rather than named and rejected.
+        #[cfg(unix)]
         ListenAddr::Unix(_) => settings.port,
     };
 

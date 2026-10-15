@@ -394,12 +394,16 @@ impl ResidentCache {
 /// Returns [`ConfigError`] when the platform does not say. A server sized
 /// by RAM is worth more than one sized by nothing, so callers that can fall
 /// back to a count limit should.
+#[cfg(target_os = "macos")]
 pub fn physical_memory_bytes() -> Result<u64, ConfigError> {
     // sysctl hw.memsize, read directly rather than shelling out to
     // sysctl: this runs on the request path when a cache is first created.
     let mut size: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     let name = b"hw.memsize\0";
+    // SAFETY: `name` is a NUL-terminated C string, and `size`/`len` are a
+    // correctly typed, aligned out-buffer and its length. `sysctlbyname` writes
+    // at most `len` bytes and reports failure through its return value.
     let rc = unsafe {
         libc_sysctlbyname(
             name.as_ptr() as *const std::os::raw::c_char,
@@ -413,13 +417,10 @@ pub fn physical_memory_bytes() -> Result<u64, ConfigError> {
         return Ok(size);
     }
 
-    Err(ConfigError::Other(
-        "cannot determine physical memory; pass an explicit \
-     resident budget instead"
-            .to_string(),
-    ))
+    Err(no_memory_error())
 }
 
+#[cfg(target_os = "macos")]
 extern "C" {
     #[link_name = "sysctlbyname"]
     fn libc_sysctlbyname(
@@ -429,6 +430,61 @@ extern "C" {
         newp: *mut std::os::raw::c_void,
         newlen: usize,
     ) -> std::os::raw::c_int;
+}
+
+/// Physical RAM, in bytes.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the platform does not say.
+#[cfg(target_os = "windows")]
+pub fn physical_memory_bytes() -> Result<u64, ConfigError> {
+    // `MEMORYSTATUSEX` at the time of writing. The length field must be set to
+    // the size of this struct before the call; the API refuses to write if it
+    // disagrees. Only `total_physical` is read, but every field stays so the
+    // layout matches the C definition the API writes into.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_physical: u64,
+        available_physical: u64,
+        total_page_file: u64,
+        available_page_file: u64,
+        total_virtual: u64,
+        available_virtual: u64,
+        available_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    // SAFETY: `status` is a correctly sized and aligned `MemoryStatusEx`, and its
+    // `length` field is set to that size before the call, which is the contract
+    // the API checks before writing. All-zero is a valid value for a struct of
+    // integers. The single out-pointer is valid and writable.
+    let mut status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+    status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok != 0 && status.total_physical > 0 {
+        return Ok(status.total_physical);
+    }
+
+    Err(no_memory_error())
+}
+
+/// The error returned when the platform will not report physical memory.
+///
+/// A shared constructor keeps the wording identical across platforms, which
+/// matters because callers fall back to a model-count budget on this error.
+fn no_memory_error() -> ConfigError {
+    ConfigError::Other(
+        "cannot determine physical memory; pass an explicit \
+     resident budget instead"
+            .to_string(),
+    )
 }
 
 /// The idle model a caller would use least, if any.
@@ -882,10 +938,10 @@ mod tests {
 
     #[test]
     fn physical_memory_is_reported_when_the_platform_knows() {
-        // macOS is the only supported platform and always knows the answer, so
-        // this is a real check rather than an assumption: it must come back
-        // plausible, not an error.
-        let bytes = physical_memory_bytes().expect("sysctl hw.memsize must report on macOS");
+        // Every supported platform knows the answer -- sysctl on macOS,
+        // GlobalMemoryStatusEx on Windows -- so this is a real check rather than
+        // an assumption: it must come back plausible, not an error.
+        let bytes = physical_memory_bytes().expect("the platform must report physical memory");
         // Below 64 MB is not a machine; above 1 TiB is not either.
         assert!(bytes > 64 * 1024 * 1024, "implausible: {bytes} bytes");
         assert!(bytes < 1024 * 1024 * 1024 * 1024, "implausible: {bytes}");

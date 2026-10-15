@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/badge/version-1.0.0--beta.1-yellowgreen.svg)](https://github.com/Cartofell404/Assembly/releases)
-[![Platform: macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon%20(arm64)-1f6feb.svg)](https://github.com/Cartofell404/Assembly)
+[![Platform: macOS (arm64) and Windows (x64)](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Windows%20x64-1f6feb.svg)](https://github.com/Cartofell404/Assembly)
 
 [Quick start](#quick-start) · [Installation](#installation) · [Commands](#commands) · [Architecture](#architecture)
 
@@ -17,7 +17,7 @@
 ---
 
 > [!IMPORTANT]
-> **Apple Silicon Macs only.** Assembly targets `aarch64-apple-darwin`. Windows, Linux, and Intel Macs are not supported. Prebuilt binaries, the installer, and CI all assume macOS on an M-series chip.
+> **macOS on Apple Silicon (arm64) and 64-bit Windows.** Assembly targets `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`. Linux and Intel Macs are not supported. Prebuilt binaries, the installers, and CI cover macOS on an M-series chip and Windows on x64.
 
 > [!NOTE]
 > **Status: 1.0.0-beta.1.** Feature-complete and usable, but it is a first beta, so expect rough edges. The archive format and CLI are stabilising but not yet frozen.
@@ -58,11 +58,15 @@ assembly info models.asmb --verify
 assembly run models.asmb "Write a hello world in Rust"
 ```
 
+The commands are identical on macOS and Windows; only the shell differs, so on Windows run the same lines in Command Prompt (paths use `\` there).
+
 ## Installation
 
-Assembly supports **macOS on Apple Silicon (arm64) only**. The crates are not published to crates.io, so install from a prebuilt binary or from a checkout.
+Assembly supports **macOS on Apple Silicon (arm64)** and **64-bit Windows**. The crates are not published to crates.io, so install from a prebuilt binary or from a checkout.
 
 ### Option 1: Installer script
+
+**macOS (Apple Silicon)**
 
 ```bash
 git clone https://github.com/Cartofell404/Assembly
@@ -71,6 +75,20 @@ cd Assembly
 ```
 
 Remove Assembly later with `./uninstall.sh`.
+
+**Windows (Command Prompt, 64-bit)**
+
+```bat
+git clone https://github.com/Cartofell404/Assembly
+cd Assembly
+install.bat                 # checks the toolchain, then builds and installs
+install.bat --install-deps  # same, but install missing prerequisites with winget first
+```
+
+Remove Assembly later with `uninstall.bat`.
+
+> [!NOTE]
+> On Windows the build needs the **MSVC Build Tools** (the default Rust target is `msvc`), **CMake**, and **LLVM** for `libclang`. `install.bat` reports anything missing, and `--install-deps` installs it through winget. The Build Tools are several gigabytes and need administrator rights, so they are never installed silently.
 
 ### Option 2: Build from source
 
@@ -83,7 +101,10 @@ cargo build --release --locked
 cargo install --path crates/cli --locked
 ```
 
-**Prerequisites:** Rust 1.88+ (via [`rustup`](https://rustup.rs)), `cmake`, and `clang`. On macOS, get these from Xcode Command Line Tools (`xcode-select --install`) or Homebrew (`cmake`, `llvm`).
+**Prerequisites:** Rust 1.88+ (via [`rustup`](https://rustup.rs)), `cmake`, and `clang`, to compile llama.cpp.
+
+- **macOS:** get these from the Xcode Command Line Tools (`xcode-select --install`) or Homebrew (`cmake`, `llvm`).
+- **Windows:** install the MSVC Build Tools ("Desktop development with C++"), CMake, and LLVM. If bindgen cannot find `libclang.dll`, point it at the directory that holds it with `setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"`.
 
 > [!TIP]
 > The first build compiles llama.cpp from source and takes several minutes (about 5–15, depending on your machine). Later builds are incremental.
@@ -269,7 +290,7 @@ Inside a session, `/clear` drops the history and `/quit` (or Ctrl-D) exits. Answ
 | Variable | Effect |
 | --- | --- |
 | `ASSEMBLY_ARCHIVE` | Archive that `run` uses when no path is given |
-| `ASSEMBLY_LLAMA_LOG=1` | Let llama.cpp print its own startup output (`ggml_metal_device_init`, pipeline compiles, and so on). Off by default: it is noise on every start and says nothing about your archive |
+| `ASSEMBLY_LLAMA_LOG=1` | Let llama.cpp print its own startup output (`ggml_metal_device_init` on macOS, the backend banner on Windows, and so on). Off by default: it is noise on every start and says nothing about your archive |
 
 ## Architecture
 
@@ -300,14 +321,15 @@ Workspace crates: `asmb-format` (archive format), `assembly-core` (router), `ass
 
 ## Requirements
 
-- macOS on Apple Silicon (arm64), the only supported platform
+- macOS on Apple Silicon (arm64) or 64-bit Windows
 - Rust 1.88+ to build from source
-- `cmake` and `clang` to compile llama.cpp
+- `cmake` and `clang` to compile llama.cpp (on Windows, the MSVC Build Tools as well)
 - Models in GGUF format
 
 ## Known limitations
 
-- Apple Silicon macOS only
+- macOS support is limited to Apple Silicon (arm64); Intel Macs are not supported
+- Windows support targets 64-bit x64; ARM64 Windows is untested
 - Beta: the archive format and CLI may still change
 - Not published to crates.io; install via binary, installer, or source
 

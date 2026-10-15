@@ -8,6 +8,17 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// A path, escaped for the inside of a JSON string literal.
+///
+/// `Path::display` uses the platform separator, so a Windows temporary path
+/// arrives as `C:\Users\...` and `\U` is not a valid JSON escape, which would
+/// make the generated config unparseable before any check could see it. Running
+/// the text through `serde_json` gives exactly the escaping JSON expects.
+fn jp(path: impl std::fmt::Display) -> String {
+    let quoted = serde_json::to_string(&path.to_string()).unwrap();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
 /// Path to the binary under test.
 ///
 /// `CARGO_BIN_EXE_*` is set by cargo for integration tests, which is the
@@ -51,7 +62,7 @@ impl Fixture {
             .map(|(name, path)| {
                 format!(
                     r#"{{"name":"{name}","path":"{}","anchors":["some work"]}}"#,
-                    path.display()
+                    jp(path.display())
                 )
             })
             .collect();
@@ -61,7 +72,7 @@ impl Fixture {
                 "embedding": {{"name":"route","path":"{}","confidence_threshold":0.6}},
                 "models": [{}]
             }}"#,
-            router.display(),
+            jp(router.display()),
             entries.join(",")
         );
         let path = self.path("config.json");
@@ -222,9 +233,9 @@ fn info_separates_anchor_phrases_from_anchor_vectors() {
                 "embedding":{{"name":"route","path":"{}"}},
                 "models":[{{"name":"phrases_only","path":"{}","anchors":["hello","goodbye"]}},
                           {{"name":"other","path":"{}","anchors":["x"]}}]}}"#,
-            router.display(),
-            a.display(),
-            b.display()
+            jp(router.display()),
+            jp(a.display()),
+            jp(b.display())
         ),
     )
     .unwrap();
@@ -476,9 +487,9 @@ fn every_problem_is_reported_at_once() {
                 "embedding":{{"name":"r","path":"{}"}},
                 "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                           {{"name":"a","path":"{}","anchors":["x"]}}]}}"#,
-            router.display(),
-            fx.path("gone.gguf").display(),
-            good.display()
+            jp(router.display()),
+            jp(fx.path("gone.gguf").display()),
+            jp(good.display())
         ),
     )
     .unwrap();
@@ -606,9 +617,9 @@ fn the_built_archive_contains_the_configured_persona_and_threshold() {
                 "embedding":{{"name":"route","path":"{}","confidence_threshold":0.33,"fallback_model":"code"}},
                 "models":[{{"name":"general","path":"{}","anchors":["chat"]}},
                           {{"name":"code","path":"{}","anchors":["code"]}}]}}"#,
-            router.display(),
-            a.display(),
-            b.display()
+            jp(router.display()),
+            jp(a.display()),
+            jp(b.display())
         ),
     )
     .unwrap();
@@ -643,9 +654,9 @@ fn a_config_pointing_at_a_missing_fallback_is_rejected() {
                 "embedding":{{"name":"route","path":"{}","fallback_model":"ghost"}},
                 "models":[{{"name":"a","path":"{}","anchors":["x"]}},
                           {{"name":"b","path":"{}","anchors":["x"]}}]}}"#,
-            router.display(),
-            a.display(),
-            b.display()
+            jp(router.display()),
+            jp(a.display()),
+            jp(b.display())
         ),
     )
     .unwrap();
